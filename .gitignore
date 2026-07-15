@@ -2,3 +2,4 @@ node_modules/
 .chrome-profile/
 downloads/
 screenshots/
+feishu.config.json

@@ -1,4 +1,5 @@
 const path = require('path');
+const { resolveChromePath } = require('./utils');
 
 module.exports = {
   loginUrl: 'https://live.youinsh.com/livestream/qiniulogin',
@@ -12,5 +13,6 @@ module.exports = {
   screenshotDir: path.join(__dirname, 'screenshots'),
   userDataDir: path.join(__dirname, '.chrome-profile'),
 
-  chromePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+  // 支持 CHROME_PATH 环境变量；Mac/Windows 自动探测常见安装路径
+  chromePath: resolveChromePath(),
 };

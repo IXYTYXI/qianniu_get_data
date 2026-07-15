@@ -6,9 +6,12 @@
   "scripts": {
     "start": "node index.js",
     "video": "node index.js --mode video",
-    "barrage": "node index.js --mode barrage"
+    "barrage": "node index.js --mode barrage",
+    "transcode": "node index.js --mode transcode",
+    "import-barrage": "node import-barrage.js"
   },
   "dependencies": {
-    "playwright": "^1.61.1"
+    "playwright": "^1.61.1",
+    "xlsx": "^0.18.5"
   }
 }

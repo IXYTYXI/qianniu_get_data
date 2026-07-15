@@ -1,0 +1,11 @@
+{
+  "month": "2026-07",
+  "baseName": "直播弹幕-2026-07",
+  "baseToken": "YOUR_BASE_TOKEN",
+  "baseUrl": "https://your-domain.feishu.cn/base/YOUR_BASE_TOKEN",
+  "tables": {
+    "小学": { "name": "小学弹幕", "tableId": "tblXXXXXXXX" },
+    "初中": { "name": "初中弹幕", "tableId": "tblXXXXXXXX" },
+    "高中": { "name": "高中弹幕", "tableId": "tblXXXXXXXX" }
+  }
+}
