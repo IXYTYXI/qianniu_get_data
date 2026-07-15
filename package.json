@@ -1,0 +1,14 @@
+{
+  "name": "qianniu-downloader",
+  "version": "1.0.0",
+  "description": "千牛直播视频和弹幕自动下载工具",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "video": "node index.js --mode video",
+    "barrage": "node index.js --mode barrage"
+  },
+  "dependencies": {
+    "playwright": "^1.61.1"
+  }
+}
