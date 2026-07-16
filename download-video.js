@@ -180,11 +180,11 @@ async function downloadTranscodedVideo(targetPage, live) {
   const savePath = buildVideoPath(live, download.suggestedFilename());
   await download.saveAs(savePath);
   const size = await waitForFileReady(savePath);
+  await closeDialog(dialog);
   process.stdout.write('\n');
   const sizeMb = (size / 1024 / 1024).toFixed(1);
   console.log(`  视频已保存: ${savePath} (${sizeMb} MB)`);
 
-  await closeDialog(dialog);
   return { status: 'downloaded', filePath: savePath };
 }
 
@@ -200,6 +200,7 @@ async function downloadLive(context, page, live) {
     return { liveId: live.id, live, status: 'error', error: err.message };
   } finally {
     if (targetPage !== page && !targetPage.isClosed()) {
+      await targetPage.waitForTimeout(1000);
       await targetPage.close().catch(() => {});
     }
   }

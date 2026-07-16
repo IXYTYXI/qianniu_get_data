@@ -3,6 +3,7 @@ const path = require('path');
 const XLSX = require('xlsx');
 const appConfig = require('./config');
 const api = require('./feishu-api');
+const { FIELD_TYPE } = api;
 
 const FEISHU_CONFIG_PATH = path.join(__dirname, 'feishu.config.json');
 const BATCH_SIZE = 200;
@@ -45,8 +46,17 @@ async function ensureFields(appToken, tableId, headers) {
   for (const header of headers) {
     if (!header || existingNames.has(header)) continue;
     console.log(`  创建字段: ${header}`);
-    await api.createField(appToken, tableId, header, 'text');
-    existingNames.add(header);
+    try {
+      await api.createField(appToken, tableId, header, 'text');
+      existingNames.add(header);
+    } catch (e) {
+      if (/FieldNameDuplicated|1254014/.test(e.message)) {
+        console.log(`  字段已存在，跳过: ${header}`);
+        existingNames.add(header);
+        continue;
+      }
+      throw e;
+    }
   }
 }
 
@@ -56,42 +66,98 @@ function extractDate(timeStr) {
   return m ? m[1] : 'unknown';
 }
 
-async function getMaxSeqForDate(appToken, tableId, date) {
-  try {
-    const items = await api.searchRecords(appToken, tableId, {
-      filter: {
-        conjunction: 'and',
-        conditions: [{
-          field_name: '时间',
-          operator: 'contains',
-          value: [date],
-        }],
-      },
-      field_names: [SEQ_FIELD],
-      page_size: 200,
+async function listRecordsForDate(appToken, tableId, date) {
+  return api.searchRecordsAll(appToken, tableId, {
+    filter: {
+      conjunction: 'and',
+      conditions: [{
+        field_name: '时间',
+        operator: 'contains',
+        value: [date],
+      }],
+    },
+    field_names: ['时间', SEQ_FIELD],
+  });
+}
+
+async function deleteRecordsForDate(appToken, tableId, date) {
+  const items = await listRecordsForDate(appToken, tableId, date);
+  if (!items.length) return 0;
+  const ids = items.map((item) => item.record_id).filter(Boolean);
+  await api.batchDeleteRecords(appToken, tableId, ids);
+  console.log(`  已清除 ${date} 旧记录 ${ids.length} 条`);
+  return ids.length;
+}
+
+async function resequenceRecordsForDate(appToken, tableId, date) {
+  const items = await listRecordsForDate(appToken, tableId, date);
+  if (!items.length) return 0;
+
+  items.sort((a, b) => {
+    const ta = String(a.fields?.['时间'] || '');
+    const tb = String(b.fields?.['时间'] || '');
+    return ta.localeCompare(tb);
+  });
+
+  const updates = [];
+  for (let i = 0; i < items.length; i++) {
+    const seq = i + 1;
+    const current = Number(items[i].fields?.[SEQ_FIELD]);
+    if (current === seq) continue;
+    updates.push({
+      record_id: items[i].record_id,
+      fields: { [SEQ_FIELD]: seq },
     });
-    let max = 0;
-    for (const item of items) {
-      const seq = Number(item.fields?.[SEQ_FIELD]);
-      if (!Number.isNaN(seq) && seq > max) max = seq;
+  }
+
+  if (updates.length) {
+    await api.batchUpdateRecords(appToken, tableId, updates);
+    console.log(`  日期 ${date}: 已更新 ${updates.length} 条序号 → 1 ~ ${items.length}`);
+  } else {
+    console.log(`  日期 ${date}: 序号已是 1 ~ ${items.length}，无需更新`);
+  }
+  return items.length;
+}
+
+function buildDailySeqFormula(tableName) {
+  // 同一天内按「时间」升序排名，每天从 1 重新开始
+  return `IF(ISBLANK([时间]),"",${tableName}.FILTER(LEFT(CurrentValue.[时间],10)=LEFT([时间],10)&&CurrentValue.[时间]<=[时间]).[时间].COUNTA())`;
+}
+
+async function ensureDailySeqField(appToken, tableId, tableName) {
+  const existing = await api.listTableFields(appToken, tableId);
+  const seqField = existing.find((f) => f.field_name === SEQ_FIELD);
+
+  if (seqField?.type === FIELD_TYPE.formula) {
+    return;
+  }
+
+  if (seqField) {
+    console.log(`  序号字段为手动数字类型，改为公式自动编号...`);
+    await api.deleteField(appToken, tableId, seqField.field_id);
+  }
+
+  const formula = buildDailySeqFormula(tableName);
+  try {
+    await api.createField(appToken, tableId, SEQ_FIELD, 'formula', {
+      formula_expression: formula,
+    });
+    console.log(`  已创建公式字段「序号」（按日期自动编号）`);
+  } catch (e) {
+    if (/FieldNameDuplicated|1254014/.test(e.message)) {
+      console.log(`  序号公式字段已存在，跳过`);
+      return;
     }
-    return max;
-  } catch {
-    return 0;
+    throw e;
   }
 }
 
-async function ensureSeqField(appToken, tableId) {
-  const existing = await api.listTableFields(appToken, tableId);
-  if (existing.some((f) => f.field_name === SEQ_FIELD)) return;
-  await api.createField(appToken, tableId, SEQ_FIELD, 'number');
-  console.log(`  创建字段: ${SEQ_FIELD}`);
-}
-
-async function buildImportRows(headers, dataRows, appToken, tableId) {
+async function buildImportRows(headers, dataRows) {
   const timeIdx = headers.indexOf('时间');
-  const filteredHeaders = headers.filter((h) => h && !SKIP_IMPORT_COLUMNS.has(h));
-  const importHeaders = [SEQ_FIELD, ...filteredHeaders];
+  const filteredHeaders = headers.filter(
+    (h) => h && !SKIP_IMPORT_COLUMNS.has(h) && h !== SEQ_FIELD
+  );
+  const importHeaders = [...filteredHeaders];
 
   const dateGroups = {};
   for (const row of dataRows) {
@@ -102,21 +168,19 @@ async function buildImportRows(headers, dataRows, appToken, tableId) {
 
   const allRows = [];
   for (const [date, rows] of Object.entries(dateGroups)) {
-    let seq = await getMaxSeqForDate(appToken, tableId, date);
     for (const row of rows) {
-      seq += 1;
       const values = filteredHeaders.map((h) => {
         const idx = headers.indexOf(h);
         const val = row[idx];
         if (val == null || String(val).trim() === '') return null;
         return String(val);
       });
-      allRows.push([seq, ...values]);
+      allRows.push(values);
     }
-    console.log(`  日期 ${date}: 序号 ${seq - rows.length + 1} ~ ${seq}`);
+    console.log(`  日期 ${date}: ${rows.length} 条（序号由公式按日自动生成）`);
   }
 
-  return { importHeaders, allRows };
+  return { importHeaders, allRows, dates: Object.keys(dateGroups) };
 }
 
 function readXlsx(filePath) {
@@ -137,11 +201,8 @@ function rowsToRecords(headers, dataRows) {
     headers.forEach((header, idx) => {
       const val = row[idx];
       if (val == null || String(val).trim() === '') return;
-      if (header === SEQ_FIELD) {
-        fields[header] = Number(val);
-      } else {
-        fields[header] = String(val);
-      }
+      if (header === SEQ_FIELD) return;
+      fields[header] = String(val);
     });
     return { fields };
   });
@@ -339,9 +400,13 @@ async function importBarrageToFeishu(filePath, hintText = '') {
 
   const writableHeaders = headers.filter((h) => h && !SKIP_IMPORT_COLUMNS.has(h));
   await ensureFields(config.baseToken, table.tableId, writableHeaders);
-  await ensureSeqField(config.baseToken, table.tableId);
+  await ensureDailySeqField(config.baseToken, table.tableId, table.name);
 
-  const { importHeaders, allRows } = await buildImportRows(headers, dataRows, config.baseToken, table.tableId);
+  const { importHeaders, allRows, dates } = buildImportRows(headers, dataRows);
+  for (const date of dates) {
+    if (date === 'unknown') continue;
+    await deleteRecordsForDate(config.baseToken, table.tableId, date);
+  }
   await batchCreateRecords(config.baseToken, table.tableId, importHeaders, allRows);
 
   fs.unlinkSync(filePath);
@@ -353,6 +418,7 @@ module.exports = {
   loadFeishuConfig,
   detectSchoolLevel,
   importBarrageToFeishu,
+  resequenceRecordsForDate,
   ensureVideoTable,
   uploadVideoToFeishu,
   uploadAudioToFeishu,

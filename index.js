@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const config = require('./config');
 const { importBarrageToFeishu } = require('./feishu');
+const { findRowByLiveId } = require('./browser');
 
 // ========== UTC+8 Timezone Helpers ==========
 
@@ -56,6 +57,8 @@ class QianniuDownloader {
     this.page = null;
     this.downloadedFiles = [];
     this.pendingDownloads = new Map();
+    this.downloadTasks = new Set();
+    this.suppressAutoDownloadHandler = false;
 
     if (options.date === 'yesterday') {
       this.targetDate = getYesterdayUTC8();
@@ -103,11 +106,28 @@ class QianniuDownloader {
 
   bindPageDownload(page) {
     page.on('download', async (download) => {
+      if (this.suppressAutoDownloadHandler) return;
       await this.handleDownload(download, page);
     });
   }
 
+  async waitForAllDownloads() {
+    if (this.downloadTasks.size === 0) return;
+    console.log(`  等待下载完成（${this.downloadTasks.size} 个任务）...`);
+    await Promise.all([...this.downloadTasks]);
+  }
+
   async handleDownload(download, page) {
+    const task = this._handleDownload(download, page);
+    this.downloadTasks.add(task);
+    try {
+      await task;
+    } finally {
+      this.downloadTasks.delete(task);
+    }
+  }
+
+  async _handleDownload(download, page) {
     const filename = download.suggestedFilename();
     const savePath = path.join(config.downloadDir, filename);
     const hintText = this.pendingDownloads.get(page) || '';
@@ -258,42 +278,78 @@ class QianniuDownloader {
     return { allRows, matches };
   }
 
-  async processRow(allRows, rowIndex, seqIndex) {
-    const row = allRows.nth(rowIndex);
-    const text = await row.textContent().catch(() => '');
-    const idMatch = text.match(/(\d{6})/);
-    const liveId = idMatch?.[1] || rowIndex;
-    console.log(`\n--- 处理直播 ${liveId} (${seqIndex + 1}) ---`);
+  async describeLocator(locator) {
+    const text = ((await locator.textContent().catch(() => '')) || '').replace(/\s+/g, ' ').trim();
+    return text.slice(0, 80) || '(无文本)';
+  }
 
-    // From the screenshot, operations column has: 去开播 | 中控台 | 观看链接 | ...
-    // The "..." is a dropdown trigger with more options
-
-    // Try the "..." more-options button first
-    const moreBtn = row.locator(
-      'a:has-text("…"), span:has-text("…"), ' +
-      'a:has-text("..."), span:has-text("..."), ' +
-      '.ant-dropdown-trigger, ' +
-      'button[class*="more"], a[class*="more"], ' +
-      'i[class*="more"], i[class*="ellipsis"]'
-    ).first();
-
-    if (await moreBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-      console.log('点击更多操作...');
-      await moreBtn.click();
-      await this.page.waitForTimeout(1500);
-      await this.screenshot(`05-menu-${liveId}`);
-
-      // Look for video/barrage options in the dropdown
-      await this.handleDropdownActions(liveId);
-    } else {
-      console.log('"..." 按钮未找到，尝试中控台入口...');
+  async clickWhenReady(locator, label, options = {}) {
+    const visible = await locator.isVisible({ timeout: options.timeout || 5000 }).catch(() => false);
+    if (!visible) {
+      console.log(`  跳过: 未找到 ${label}`);
+      return false;
     }
 
-    // Also try the "中控台" link (control center) for more download options
-    const controlBtn = row.locator('button:has-text("中控台"), a:has-text("中控台")').first();
-    if (await controlBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
-      await row.scrollIntoViewIfNeeded();
-      await this.handleControlCenter(controlBtn, liveId, text);
+    const text = await this.describeLocator(locator);
+    if (options.skipIf?.test(text)) {
+      console.log(`  跳过: ${label} 当前状态「${text}」，无需点击`);
+      return false;
+    }
+    if (options.requireText && !options.requireText.test(text)) {
+      console.log(`  跳过: ${label} 文案不符「${text}」`);
+      return false;
+    }
+
+    console.log(`  确认点击: ${label} → 「${text}」`);
+    await locator.scrollIntoViewIfNeeded().catch(() => {});
+    await locator.click();
+    if (options.waitMs) await locator.page().waitForTimeout(options.waitMs);
+    return true;
+  }
+
+  async processRow(liveId, rowText = '', seqIndex = 0) {
+    console.log(`\n--- 处理直播 ${liveId} (${seqIndex + 1}) ---`);
+
+    const row = await findRowByLiveId(this.page, liveId);
+    if (!row) {
+      console.log(`未找到直播行: ${liveId}`);
+      return;
+    }
+
+    await row.scrollIntoViewIfNeeded();
+    await this.page.waitForTimeout(500);
+
+    const skipMoreMenu = this.options.mode === 'barrage-task';
+    if (!skipMoreMenu) {
+      const moreBtn = row.locator(
+        'a:has-text("…"), span:has-text("…"), ' +
+        'a:has-text("..."), span:has-text("..."), ' +
+        '.ant-dropdown-trigger, ' +
+        'button[class*="more"], a[class*="more"], ' +
+        'i[class*="more"], i[class*="ellipsis"]'
+      ).first();
+
+      if (await moreBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+        console.log('点击更多操作...');
+        await moreBtn.click();
+        await this.page.waitForTimeout(1500);
+        await this.screenshot(`05-menu-${liveId}`);
+        await this.handleDropdownActions(liveId);
+      } else {
+        console.log('"..." 按钮未找到');
+      }
+    } else {
+      console.log('barrage-task 模式: 跳过「...」菜单，直接进入中控台');
+    }
+
+    const controlBtn = row.locator(
+      'button:has-text("中控台"), a:has-text("中控台"), span:has-text("中控台")'
+    ).first();
+    const btnCount = await controlBtn.count().catch(() => 0);
+    if (btnCount && await controlBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+      await this.handleControlCenter(controlBtn, liveId, rowText);
+    } else {
+      console.log('未找到中控台按钮');
     }
   }
 
@@ -316,7 +372,7 @@ class QianniuDownloader {
     }
 
     // Check for barrage export in dropdown
-    if (this.options.mode === 'all' || this.options.mode === 'barrage') {
+    if (this.options.mode === 'all' || this.options.mode === 'barrage' || this.options.mode === 'barrage-task') {
       const barrageOpt = this.page.locator(
         'li:visible:has-text("弹幕"), a:visible:has-text("弹幕"), ' +
         'li:visible:has-text("导出"), span:visible:has-text("弹幕"), ' +
@@ -339,27 +395,39 @@ class QianniuDownloader {
 
   async handleControlCenter(controlBtn, liveId, rowText = '') {
     console.log('打开中控台...');
+    const controlText = await this.describeLocator(controlBtn);
+    console.log(`  确认点击: 中控台 → 「${controlText}」`);
 
     const [newPage] = await Promise.all([
       this.context.waitForEvent('page', { timeout: 10000 }).catch(() => null),
-      controlBtn.click({ force: true }),
+      controlBtn.click(),
     ]);
 
     const targetPage = newPage || this.page;
     if (newPage) {
       await newPage.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
     }
-    await targetPage.waitForTimeout(2000);
+    await targetPage.waitForTimeout(3000);
 
     const controlUrl = targetPage.url();
     console.log(`中控台页面: ${controlUrl}`);
+    if (!controlUrl.includes(`id=${liveId}`)) {
+      console.log(`  警告: 中控台 URL 与直播 ID ${liveId} 不一致，跳过后续操作`);
+      if (newPage) await newPage.close();
+      return;
+    }
+
     await targetPage.screenshot({
       path: path.join(config.screenshotDir, `08-control-${liveId}.png`),
     });
 
+    await this.closeBlockingDialogs(targetPage, '进入中控台后');
+
     if (this.options.mode === 'transcode' || this.options.mode === 'all' || this.options.mode === 'barrage-task') {
       await this.triggerTranscode(targetPage, liveId);
     }
+
+    await this.closeBlockingDialogs(targetPage, '转码检查后');
 
     if (this.options.mode === 'all' || this.options.mode === 'barrage' || this.options.mode === 'barrage-task') {
       await this.exportBarrage(targetPage, liveId, rowText);
@@ -371,70 +439,161 @@ class QianniuDownloader {
         'button:has-text("录制"), a:has-text("回放下载")'
       ).first();
       if (await dlBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-        console.log('中控台找到视频下载按钮');
-        await dlBtn.click();
-        await targetPage.waitForTimeout(5000);
+        this.suppressAutoDownloadHandler = true;
+        try {
+          const [download] = await Promise.all([
+            targetPage.waitForEvent('download', { timeout: config.videoDownloadTimeout || 600000 }).catch(() => null),
+            this.clickWhenReady(dlBtn, '视频下载按钮'),
+          ]);
+          if (download) {
+            await this.handleDownload(download, targetPage);
+          }
+          await this.waitForAllDownloads();
+        } finally {
+          this.suppressAutoDownloadHandler = false;
+        }
       }
     }
 
-    if (newPage) {
+    await this.waitForAllDownloads();
+    if (newPage && !newPage.isClosed()) {
+      await newPage.waitForTimeout(1000);
       await newPage.close();
+    }
+  }
+
+  async closeBlockingDialogs(targetPage, stage = '') {
+    const dialogSelectors = [
+      '.el-dialog__wrapper',
+      '.el-overlay-dialog',
+      '[role="dialog"]',
+    ];
+
+    for (let round = 0; round < 5; round++) {
+      let closed = false;
+      for (const selector of dialogSelectors) {
+        const dialogs = targetPage.locator(selector);
+        const count = await dialogs.count().catch(() => 0);
+        for (let i = 0; i < count; i++) {
+          const dialog = dialogs.nth(i);
+          if (!(await dialog.isVisible({ timeout: 300 }).catch(() => false))) continue;
+
+          const title = ((await dialog.textContent().catch(() => '')) || '').replace(/\s+/g, ' ').trim();
+          const titleText = title.slice(0, 40) || '未知弹窗';
+          const closeBtn = dialog.locator('.el-dialog__headerbtn, .el-icon-close, button[aria-label="Close"]').first();
+          if (await closeBtn.isVisible({ timeout: 500 }).catch(() => false)) {
+            console.log(`  关闭弹窗${stage ? `(${stage})` : ''}: ${titleText}`);
+            await closeBtn.click();
+            await targetPage.waitForTimeout(800);
+            closed = true;
+          }
+        }
+      }
+      if (!closed) break;
+    }
+
+    const warmupDialog = targetPage.locator('.el-dialog__wrapper.robot-send, .el-dialog__wrapper')
+      .filter({ hasText: '系统暖场评论' }).first();
+    if (await warmupDialog.isVisible({ timeout: 500 }).catch(() => false)) {
+      const closeBtn = warmupDialog.locator('.el-dialog__headerbtn').first();
+      if (await closeBtn.isVisible({ timeout: 500 }).catch(() => false)) {
+        console.log(`  关闭弹窗${stage ? `(${stage})` : ''}: 系统暖场评论`);
+        await closeBtn.click();
+        await targetPage.waitForTimeout(800);
+      }
     }
   }
 
   async exportBarrage(targetPage, liveId, rowText = '') {
     console.log('导出弹幕...');
+    await this.closeBlockingDialogs(targetPage, '弹幕导出前');
 
-    const exportBtn = targetPage.locator(
-      '.chat span:has-text("导出所有评论消息") .footer-t-btn, ' +
-      '.chat .footer-t-btn:has(img.footer-t-icon)'
-    ).first();
-
-    if (!(await exportBtn.isVisible({ timeout: 5000 }).catch(() => false))) {
-      console.log('未找到弹幕导出按钮');
+    const warmupDialog = targetPage.locator('.el-dialog__wrapper.robot-send, .el-dialog__wrapper')
+      .filter({ hasText: '系统暖场评论' }).first();
+    if (await warmupDialog.isVisible({ timeout: 500 }).catch(() => false)) {
+      console.log('  「系统暖场评论」弹窗仍在，停止导出');
+      await targetPage.screenshot({ path: path.join(config.screenshotDir, `barrage-blocked-${liveId}.png`) });
       return;
     }
 
-    this.pendingDownloads.set(targetPage, rowText);
-    const [download] = await Promise.all([
-      targetPage.waitForEvent('download', { timeout: 30000 }).catch(() => null),
-      exportBtn.click(),
-    ]);
+    const chatPanel = targetPage.locator('.chat').first();
+    if (!(await chatPanel.isVisible({ timeout: 5000 }).catch(() => false))) {
+      console.log('  未找到右侧评论面板');
+      await targetPage.screenshot({ path: path.join(config.screenshotDir, `barrage-missing-${liveId}.png`) });
+      return;
+    }
 
-    if (download) {
-      await this.handleDownload(download, targetPage);
-    } else {
-      console.log('弹幕下载未触发，请检查页面状态');
-      this.pendingDownloads.delete(targetPage);
+    await chatPanel.evaluate((el) => { el.scrollTop = el.scrollHeight; }).catch(() => {});
+    await targetPage.waitForTimeout(800);
+
+    // 评论区底部有 3 个 footer-t-btn，顺序固定：
+    // [0] 系统暖场评论(机器人) [1] 全体禁言 [2] 导出评论(icon-chat-export)
+    const exportBtn = chatPanel.locator(
+      '.footer-t-btn:has(img[src*="icon-chat-export"]), img.footer-t-icon[src*="icon-chat-export"]'
+    ).first();
+
+    if (!(await exportBtn.isVisible({ timeout: 5000 }).catch(() => false))) {
+      console.log('  未找到导出图标 icon-chat-export，停止操作');
+      await targetPage.screenshot({ path: path.join(config.screenshotDir, `barrage-missing-${liveId}.png`) });
+      return;
+    }
+
+    const btnMeta = await exportBtn.evaluate((el) => ({
+      tag: el.tagName,
+      className: el.className,
+      src: el.getAttribute?.('src') || el.querySelector?.('img')?.getAttribute('src') || '',
+    }));
+    console.log(`  确认导出按钮: ${btnMeta.tag}.${btnMeta.className} src=${btnMeta.src}`);
+
+    this.pendingDownloads.set(targetPage, rowText);
+    this.suppressAutoDownloadHandler = true;
+    try {
+      const [download] = await Promise.all([
+        targetPage.waitForEvent('download', { timeout: 60000 }).catch(() => null),
+        exportBtn.click(),
+      ]);
+
+      if (download) {
+        await this.handleDownload(download, targetPage);
+        await this.waitForAllDownloads();
+      } else {
+        console.log('  弹幕下载未触发，请查看截图');
+        this.pendingDownloads.delete(targetPage);
+      }
+    } finally {
+      this.suppressAutoDownloadHandler = false;
     }
 
     await targetPage.screenshot({ path: path.join(config.screenshotDir, `barrage-${liveId}.png`) });
   }
 
   async triggerTranscode(targetPage, liveId) {
-    console.log('触发视频转码...');
+    console.log('检查视频转码状态...');
 
-    const replayDownload = targetPage.locator('li.tabs:has-text("回放下载"), span:has-text("回放下载")').first();
-    if (!(await replayDownload.isVisible({ timeout: 5000 }).catch(() => false))) {
-      console.log('未找到「回放下载」菜单');
+    const replayDownload = targetPage.locator(
+      '.nav-list li:has-text("回放下载"), .sidebar li:has-text("回放下载"), ' +
+      '.left-nav :text-is("回放下载"), li.tabs:has-text("回放下载")'
+    ).first();
+
+    const opened = await this.clickWhenReady(replayDownload, '左侧「回放下载」菜单', { waitMs: 2000 });
+    if (!opened) return;
+
+    const dialog = targetPage.locator('.el-dialog__wrapper:visible').filter({ hasText: '下载视频' }).last();
+    if (!(await dialog.isVisible({ timeout: 5000 }).catch(() => false))) {
+      console.log('  未弹出「下载视频」对话框，停止转码操作');
       return;
     }
 
-    await replayDownload.click();
-    await targetPage.waitForTimeout(2000);
-
-    const dialog = targetPage.locator('.el-dialog__wrapper').filter({ hasText: '下载视频' }).last();
     const actionBtn = dialog.locator('.el-dialog__body button').first();
-    const btnText = (await actionBtn.textContent().catch(() => '')) || '';
+    const btnText = ((await actionBtn.textContent().catch(() => '')) || '').replace(/\s+/g, ' ').trim();
+    console.log(`  转码按钮状态: 「${btnText}」`);
 
-    if (btnText.includes('转码中')) {
-      console.log(`直播 ${liveId} 已在转码中`);
-    } else if (btnText) {
-      console.log(`点击转码按钮: ${btnText.trim()}`);
-      await actionBtn.click();
-      await targetPage.waitForTimeout(2000);
+    if (/转码中|处理中|请稍后/.test(btnText)) {
+      console.log(`  直播 ${liveId} 已在转码中，不点击`);
+    } else if (/转码|开始|下载/.test(btnText)) {
+      await this.clickWhenReady(actionBtn, '转码按钮', { waitMs: 2000 });
     } else {
-      console.log('未找到转码按钮');
+      console.log('  未识别转码按钮状态，不点击');
     }
 
     await targetPage.screenshot({
@@ -442,10 +601,7 @@ class QianniuDownloader {
     });
 
     const closeBtn = dialog.locator('.el-dialog__headerbtn').first();
-    if (await closeBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
-      await closeBtn.click();
-    }
-    await targetPage.waitForTimeout(500);
+    await this.clickWhenReady(closeBtn, '关闭下载视频弹窗', { waitMs: 800 });
   }
 
   async tryRecordingSection() {
@@ -472,10 +628,17 @@ class QianniuDownloader {
 
         // Find recordings matching target date
         const { allRows, matches } = await this.findMatchingRows();
-        if (matches.length > 0) {
-          for (let i = 0; i < matches.length; i++) {
-            await this.processRow(allRows, matches[i], i);
-          }
+        const seenIds = new Set();
+        const uniqueLives = [];
+        for (const rowIndex of matches) {
+          const text = await allRows.nth(rowIndex).textContent().catch(() => '');
+          const id = text.match(/(\d{6})(?=\d{4}-\d{2}-\d{2})/)?.[1] || text.match(/(\d{6})/)?.[1];
+          if (!id || seenIds.has(id)) continue;
+          seenIds.add(id);
+          uniqueLives.push({ id, rowText: text });
+        }
+        for (let i = 0; i < uniqueLives.length; i++) {
+          await this.processRow(uniqueLives[i].id, uniqueLives[i].rowText, i);
         }
       }
     } else {
@@ -504,27 +667,29 @@ class QianniuDownloader {
       await this.filterByDate();
 
       const { allRows, matches } = await this.findMatchingRows();
-      const uniqueMatches = [];
+      const uniqueLives = [];
       const seenIds = new Set();
       for (const rowIndex of matches) {
         const text = await allRows.nth(rowIndex).textContent().catch(() => '');
-        const id = text.match(/(\d{6})/)?.[1];
+        const id = text.match(/(\d{6})(?=\d{4}-\d{2}-\d{2})/)?.[1] || text.match(/(\d{6})/)?.[1];
         if (!id || seenIds.has(id)) continue;
         seenIds.add(id);
-        uniqueMatches.push(rowIndex);
+        uniqueLives.push({ id, rowText: text });
       }
 
-      if (uniqueMatches.length === 0) {
+      if (uniqueLives.length === 0) {
         console.log(`未找到 ${this.targetDate} 的直播记录`);
       } else {
-        console.log(`去重后处理 ${uniqueMatches.length} 场直播`);
-        for (let i = 0; i < uniqueMatches.length; i++) {
-          await this.processRow(allRows, uniqueMatches[i], i);
+        console.log(`去重后处理 ${uniqueLives.length} 场直播`);
+        for (let i = 0; i < uniqueLives.length; i++) {
+          await this.processRow(uniqueLives[i].id, uniqueLives[i].rowText, i);
         }
       }
 
-      // Also check the recording section
-      await this.tryRecordingSection();
+      // barrage-task 只处理直播中心列表，不再额外跳转录播区域
+      if (this.options.mode !== 'barrage-task') {
+        await this.tryRecordingSection();
+      }
 
       console.log('\n=== 下载流程完成 ===');
       if (this.downloadedFiles.length > 0) {
@@ -535,9 +700,10 @@ class QianniuDownloader {
         console.log(`截图目录: ${config.screenshotDir}`);
       }
 
-      // Wait for any pending downloads
-      console.log('等待下载完成 (30秒)...');
-      await this.page.waitForTimeout(30000);
+      // 等待所有下载任务完成后再关闭浏览器
+      console.log('等待所有下载完成...');
+      await this.waitForAllDownloads();
+      await this.page.waitForTimeout(3000);
 
       await this.screenshot('99-final');
       await this.close();

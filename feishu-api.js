@@ -5,6 +5,7 @@ const FEISHU_HOST = 'https://open.feishu.cn';
 const FIELD_TYPE = {
   text: 1,
   number: 2,
+  formula: 20,
   attachment: 17,
 };
 
@@ -101,13 +102,15 @@ async function listTableFields(appToken, tableId) {
   return data.items || [];
 }
 
-async function createField(appToken, tableId, fieldName, type) {
-  await feishuRequest('POST', appPath(appToken, `/tables/${tableId}/fields`), {
-    body: {
-      field_name: fieldName,
-      type: FIELD_TYPE[type] || FIELD_TYPE.text,
-    },
-  });
+async function createField(appToken, tableId, fieldName, type, options = {}) {
+  const body = {
+    field_name: fieldName,
+    type: FIELD_TYPE[type] || FIELD_TYPE.text,
+  };
+  if (type === 'formula' && options.formula_expression) {
+    body.property = { formula_expression: options.formula_expression };
+  }
+  await feishuRequest('POST', appPath(appToken, `/tables/${tableId}/fields`), { body });
 }
 
 async function listTables(appToken) {
@@ -158,6 +161,41 @@ async function searchRecords(appToken, tableId, payload) {
     body: payload,
   });
   return data.items || [];
+}
+
+async function searchRecordsAll(appToken, tableId, payload) {
+  const items = [];
+  let pageToken;
+  do {
+    const body = { ...payload, page_size: payload.page_size || 500 };
+    if (pageToken) body.page_token = pageToken;
+    const data = await feishuRequest('POST', appPath(appToken, `/tables/${tableId}/records/search`), {
+      body,
+    });
+    items.push(...(data.items || []));
+    pageToken = data.has_more ? data.page_token : undefined;
+  } while (pageToken);
+  return items;
+}
+
+async function batchDeleteRecords(appToken, tableId, recordIds) {
+  if (!recordIds.length) return;
+  const BATCH = 500;
+  for (let i = 0; i < recordIds.length; i += BATCH) {
+    await feishuRequest('POST', appPath(appToken, `/tables/${tableId}/records/batch_delete`), {
+      body: { records: recordIds.slice(i, i + BATCH) },
+    });
+  }
+}
+
+async function batchUpdateRecords(appToken, tableId, records) {
+  if (!records.length) return;
+  const BATCH = 500;
+  for (let i = 0; i < records.length; i += BATCH) {
+    await feishuRequest('POST', appPath(appToken, `/tables/${tableId}/records/batch_update`), {
+      body: { records: records.slice(i, i + BATCH) },
+    });
+  }
 }
 
 async function listRecords(appToken, tableId, { pageSize = 200, pageToken } = {}) {
@@ -276,6 +314,9 @@ module.exports = {
   createRecord,
   updateRecord,
   searchRecords,
+  searchRecordsAll,
+  batchDeleteRecords,
+  batchUpdateRecords,
   listRecords,
   deleteField,
   uploadAttachmentToField,

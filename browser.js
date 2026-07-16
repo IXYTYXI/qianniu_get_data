@@ -142,12 +142,24 @@ async function findLiveRows(page, targetDate) {
 async function findRowByLiveId(page, liveId) {
   const allRows = getTableRows(page);
   const rowCount = await allRows.count();
+  let fallback = null;
+
   for (let i = 0; i < rowCount; i++) {
     const row = allRows.nth(i);
     const text = (await row.textContent().catch(() => '')) || '';
-    if (text.includes(liveId)) return row;
+    if (!text.includes(liveId)) continue;
+    if (!fallback) fallback = row;
+
+    const controlBtn = row.locator(
+      'button:has-text("中控台"), a:has-text("中控台"), span:has-text("中控台")'
+    ).first();
+    const btnCount = await controlBtn.count().catch(() => 0);
+    if (btnCount && await controlBtn.isVisible({ timeout: 300 }).catch(() => false)) {
+      return row;
+    }
   }
-  return null;
+
+  return fallback;
 }
 
 function printBanner(title, targetDate) {

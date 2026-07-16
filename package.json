@@ -15,6 +15,8 @@
     "export-audio": "node export-audio.js",
     "upload-audio": "node export-audio.js --upload",
     "import-barrage": "node import-barrage.js",
+    "reseq-barrage": "node reseq-barrage.js",
+    "setup-seq-formula": "node setup-seq-formula.js",
     "verify-feishu": "node verify-feishu.js"
   },
   "dependencies": {
