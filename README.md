@@ -140,17 +140,60 @@ mkdir -p logs
 
 ### Windows（任务计划程序）
 
-创建 **两个** 计划任务，不要合并：
+项目提供了现成的脚本，位于 `scripts/windows/`：
+
+| 文件 | 作用 |
+|------|------|
+| `run-task-barrage.bat` | 执行任务 1，日志写入 `logs/` |
+| `run-task-audio.bat` | 执行任务 2，日志写入 `logs/` |
+| `install-scheduled-tasks.ps1` | 一键注册两个定时任务 |
+| `uninstall-scheduled-tasks.ps1` | 卸载定时任务 |
+
+#### 一键安装（推荐）
+
+在项目目录打开 **PowerShell**，执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/windows/install-scheduled-tasks.ps1
+```
+
+默认注册两个独立任务：
+
+| 任务名 | 时间 | 说明 |
+|--------|------|------|
+| `Qianniu-Task-Barrage` | 每天 06:00 | 转码 + 弹幕 |
+| `Qianniu-Task-Audio` | 每天 14:00 | 下载 + 音频 + 上传 |
+
+自定义时间：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/windows/install-scheduled-tasks.ps1 -BarrageTime 06:00 -AudioTime 14:00
+```
+
+#### 手动测试
+
+```bat
+scripts\windows\run-task-barrage.bat
+scripts\windows\run-task-audio.bat
+```
+
+#### 卸载
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/windows/uninstall-scheduled-tasks.ps1
+```
+
+#### 手动配置（可选）
+
+若不用安装脚本，在「任务计划程序」中创建 **两个** 计划任务，不要合并：
 
 **任务 1 — 千牛弹幕**
-- 程序：`node`
-- 参数：`task-barrage.js --date yesterday --skip-login`
+- 程序：`scripts\windows\run-task-barrage.bat`
 - 起始于：项目目录
 - 触发器：每天 06:00
 
 **任务 2 — 千牛音频**
-- 程序：`node`
-- 参数：`task-audio.js --date yesterday --skip-login`
+- 程序：`scripts\windows\run-task-audio.bat`
 - 起始于：项目目录
 - 触发器：每天 14:00
 
@@ -192,6 +235,12 @@ npm run export-audio -- --date 2026-07-14   # 仅导出音频，不上传
 qianniu_get_data/
 ├── task-barrage.js      # 定时任务 1 入口
 ├── task-audio.js        # 定时任务 2 入口
+├── scripts/
+│   └── windows/         # Windows 定时任务脚本
+│       ├── run-task-barrage.bat
+│       ├── run-task-audio.bat
+│       ├── install-scheduled-tasks.ps1
+│       └── uninstall-scheduled-tasks.ps1
 ├── index.js             # 千牛浏览器操作核心
 ├── download-video.js    # 视频下载逻辑
 ├── audio.js             # ffmpeg 音频导出
