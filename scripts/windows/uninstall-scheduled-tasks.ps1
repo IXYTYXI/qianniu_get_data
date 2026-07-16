@@ -7,16 +7,12 @@ $TaskBarrage = "Qianniu-Task-Barrage"
 $TaskAudio = "Qianniu-Task-Audio"
 
 foreach ($name in @($TaskBarrage, $TaskAudio)) {
-  & schtasks.exe /Query /TN $name *> $null
-  if ($LASTEXITCODE -ne 0) {
-    Write-Host "未找到或已删除: $name"
+  $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+  if (-not $task) {
+    Write-Host "Not found: $name"
     continue
   }
 
-  & schtasks.exe /Delete /TN $name /F *> $null
-  if ($LASTEXITCODE -eq 0) {
-    Write-Host "已删除: $name"
-  } else {
-    Write-Host "删除失败: $name (exit $LASTEXITCODE)"
-  }
+  Unregister-ScheduledTask -TaskName $name -Confirm:$false
+  Write-Host "Removed: $name"
 }
