@@ -248,12 +248,14 @@ npm run task-barrage -- --date yesterday
 
 ### 推荐执行时间（东八区）
 
+直播时段为 **08:00 – 次日 01:06**，脚本安排在剩余时间（01:06 – 08:00）执行，处理**昨天**已结束的场次。
+
 | 任务 | 建议时间 | 处理数据 |
 |------|---------|---------|
-| 任务 1 `task-barrage` | 每天 **06:00** | 昨天直播 |
-| 任务 2 `task-audio` | 每天 **12:00** 或 **14:00** | 昨天直播 |
+| 任务 1 `task-barrage` | 每天 **01:40** | 昨天直播（转码 + 弹幕） |
+| 任务 2 `task-audio` | 每天 **07:00** | 昨天直播（视频 + 音频） |
 
-任务 2 比任务 1 晚 **4–8 小时**，确保转码完成。若转码较慢，可再延后。
+任务 2 比任务 1 晚约 **5.5 小时**，给转码留出时间，并在 **08:00 开播前**完成。若转码较慢，可将任务 2 延后到 07:30。
 
 ### macOS / Linux（crontab）
 
@@ -262,11 +264,11 @@ crontab -e
 ```
 
 ```cron
-# 任务 1：转码 + 弹幕（每天 06:00，处理昨天）
-0 6 * * * cd /path/to/qianniu_get_data && /usr/local/bin/npm run task-barrage -- --date yesterday --skip-login >> logs/task-barrage.log 2>&1
+# 任务 1：转码 + 弹幕（每天 01:40，处理昨天）
+40 1 * * * cd /path/to/qianniu_get_data && /usr/local/bin/npm run task-barrage -- --date yesterday --skip-login >> logs/task-barrage.log 2>&1
 
-# 任务 2：下载视频 + 转音频 + 上传（每天 14:00，处理昨天）
-0 14 * * * cd /path/to/qianniu_get_data && /usr/local/bin/npm run task-audio -- --date yesterday --skip-login >> logs/task-audio.log 2>&1
+# 任务 2：下载视频 + 转音频 + 上传（每天 07:00，处理昨天）
+0 7 * * * cd /path/to/qianniu_get_data && /usr/local/bin/npm run task-audio -- --date yesterday --skip-login >> logs/task-audio.log 2>&1
 ```
 
 请先创建日志目录：
@@ -300,13 +302,13 @@ powershell -ExecutionPolicy Bypass -File scripts/windows/install-scheduled-tasks
 
 | 任务名 | 时间 | 说明 |
 |--------|------|------|
-| `Qianniu-Task-Barrage` | 每天 06:00 | 转码 + 弹幕 |
-| `Qianniu-Task-Audio` | 每天 14:00 | 下载 + 音频 + 上传 |
+| `Qianniu-Task-Barrage` | 每天 01:40 | 转码 + 弹幕 |
+| `Qianniu-Task-Audio` | 每天 07:00 | 下载 + 音频 + 上传 |
 
 自定义时间：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/windows/install-scheduled-tasks.ps1 -BarrageTime 06:00 -AudioTime 14:00
+powershell -ExecutionPolicy Bypass -File scripts/windows/install-scheduled-tasks.ps1 -BarrageTime 01:40 -AudioTime 07:00
 ```
 
 #### 手动测试
@@ -329,12 +331,12 @@ powershell -ExecutionPolicy Bypass -File scripts/windows/uninstall-scheduled-tas
 **任务 1 — 千牛弹幕**
 - 程序：`scripts\windows\run-task-barrage.bat`
 - 起始于：项目目录
-- 触发器：每天 06:00
+- 触发器：每天 01:40
 
 **任务 2 — 千牛音频**
 - 程序：`scripts\windows\run-task-audio.bat`
 - 起始于：项目目录
-- 触发器：每天 14:00
+- 触发器：每天 07:00
 
 ## 命令参考
 

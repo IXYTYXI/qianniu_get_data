@@ -5,11 +5,11 @@
 #   powershell -ExecutionPolicy Bypass -File scripts/windows/install-scheduled-tasks.ps1
 #
 # 自定义时间:
-#   powershell -ExecutionPolicy Bypass -File scripts/windows/install-scheduled-tasks.ps1 -BarrageTime 06:00 -AudioTime 14:00
+#   powershell -ExecutionPolicy Bypass -File scripts/windows/install-scheduled-tasks.ps1 -BarrageTime 01:40 -AudioTime 07:00
 
 param(
-  [string]$BarrageTime = "06:00",
-  [string]$AudioTime = "14:00"
+  [string]$BarrageTime = "01:40",
+  [string]$AudioTime = "07:00"
 )
 
 $ErrorActionPreference = "Stop"
