@@ -1,6 +1,6 @@
 # 注册 Windows 定时任务（两个独立任务，请勿合并）
 #
-# 用法（以管理员身份运行 PowerShell）:
+# 用法:
 #   cd 项目目录
 #   powershell -ExecutionPolicy Bypass -File scripts/windows/install-scheduled-tasks.ps1
 #
@@ -12,8 +12,6 @@ param(
   [string]$AudioTime = "07:00"
 )
 
-$ErrorActionPreference = "Stop"
-
 $ProjectRoot = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $BarrageBat = Join-Path $ProjectRoot "scripts\windows\run-task-barrage.bat"
 $AudioBat = Join-Path $ProjectRoot "scripts\windows\run-task-audio.bat"
@@ -24,6 +22,18 @@ if (-not (Test-Path $AudioBat)) { throw "未找到: $AudioBat" }
 $TaskBarrage = "Qianniu-Task-Barrage"
 $TaskAudio = "Qianniu-Task-Audio"
 
+function Remove-ScheduledTaskIfExists {
+  param([string]$Name)
+
+  & schtasks.exe /Query /TN $Name *> $null
+  if ($LASTEXITCODE -ne 0) { return }
+
+  & schtasks.exe /Delete /TN $Name /F *> $null
+  if ($LASTEXITCODE -ne 0) {
+    throw "删除旧任务失败: $Name (exit $LASTEXITCODE)"
+  }
+}
+
 function Register-DailyTask {
   param(
     [string]$Name,
@@ -32,16 +42,23 @@ function Register-DailyTask {
     [string]$Description
   )
 
-  schtasks /Delete /TN $Name /F 2>$null | Out-Null
+  Remove-ScheduledTaskIfExists -Name $Name
 
-  schtasks /Create `
+  # 路径含空格（如 Program Files）时，用 cmd.exe 包装更稳妥
+  $taskRun = "cmd.exe /c `"`"$BatPath`"`""
+
+  & schtasks.exe /Create `
     /TN $Name `
-    /TR "`"$BatPath`"" `
+    /TR $taskRun `
     /SC DAILY `
     /ST $Time `
     /RL HIGHEST `
     /F `
-    /RU $env:USERNAME | Out-Null
+    /RU $env:USERNAME *> $null
+
+  if ($LASTEXITCODE -ne 0) {
+    throw "注册任务失败: $Name (exit $LASTEXITCODE)"
+  }
 
   Write-Host "已注册: $Name"
   Write-Host "  时间: 每天 $Time"
