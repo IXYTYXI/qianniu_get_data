@@ -7,6 +7,9 @@ rem 由 Windows 任务计划程序调用，也可手动双击测试
 set "ROOT=%~dp0..\.."
 cd /d "%ROOT%"
 
+rem 若未在 .env 中配置 FFMPEG_PATH，可在此取消注释并填写实际路径
+rem set "FFMPEG_PATH=D:\tools\ffmpeg\bin\ffmpeg.exe"
+
 if not exist "logs" mkdir "logs"
 
 set "LOG=logs\task-audio-%date:~0,4%%date:~5,2%%date:~8,2%.log"

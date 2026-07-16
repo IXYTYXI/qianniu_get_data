@@ -1,5 +1,8 @@
 const path = require('path');
+const { loadDotEnv } = require('./env');
 const { resolveChromePath, resolveFfmpegPath } = require('./utils');
+
+loadDotEnv();
 
 module.exports = {
   loginUrl: 'https://live.youinsh.com/livestream/qiniulogin',

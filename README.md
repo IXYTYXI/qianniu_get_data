@@ -100,7 +100,13 @@ set CHROME_PATH=C:\path\to\chrome.exe
 2. 解压到 `C:\ffmpeg\`，确保存在 `C:\ffmpeg\bin\ffmpeg.exe`
 3. 验证：打开 cmd 执行 `C:\ffmpeg\bin\ffmpeg.exe -version`
 
-若安装在其他目录，设置环境变量：
+若安装在其他目录，在 `.env` 中设置（推荐，定时任务也会读取）：
+
+```env
+FFMPEG_PATH=C:\你的路径\ffmpeg\bin\ffmpeg.exe
+```
+
+或在 cmd 中临时设置：
 
 ```bat
 set FFMPEG_PATH=D:\tools\ffmpeg\bin\ffmpeg.exe
