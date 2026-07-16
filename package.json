@@ -14,7 +14,8 @@
     "upload-video": "node download-video.js --upload-only",
     "export-audio": "node export-audio.js",
     "upload-audio": "node export-audio.js --upload",
-    "import-barrage": "node import-barrage.js"
+    "import-barrage": "node import-barrage.js",
+    "verify-feishu": "node verify-feishu.js"
   },
   "dependencies": {
     "playwright": "^1.61.1",

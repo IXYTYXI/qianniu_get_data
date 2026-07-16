@@ -4,3 +4,4 @@ downloads/
 screenshots/
 feishu.config.json
 logs/
+.env

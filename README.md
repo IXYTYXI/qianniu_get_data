@@ -31,15 +31,122 @@
 
 ## 环境要求
 
-| 依赖 | 用途 | 安装 |
+| 依赖 | 版本 | 用途 |
 |------|------|------|
-| Node.js 18+ | 运行脚本 | https://nodejs.org |
-| Google Chrome | 浏览器自动化 | 系统安装即可 |
-| Playwright | 控制 Chrome | `npm install` 自动安装 |
-| ffmpeg | 视频转音频 | Mac: `brew install ffmpeg` |
-| lark-cli | 飞书多维表格 API | 参考飞书 CLI 文档安装并登录 |
+| Node.js | 18+ | 运行脚本（内置 `fetch`、`FormData`，无需额外 HTTP 库） |
+| Google Chrome | 最新稳定版 | 浏览器自动化（使用系统 Chrome，非 Playwright 内置浏览器） |
+| ffmpeg | 任意较新版本 | 视频转音频（任务 2 必需） |
+| npm 包 | 见 `package.json` | `playwright`（控制 Chrome）、`xlsx`（解析弹幕） |
 
-### 环境变量（可选）
+### 依赖安装说明
+
+按目标机器操作系统，依次安装以下依赖。
+
+#### 1. Node.js
+
+- 下载：https://nodejs.org （选 **LTS**，要求 **18 及以上**）
+- 安装后验证：
+
+```bash
+node -v    # 应显示 v18.x 或更高
+npm -v
+```
+
+#### 2. 项目 npm 依赖
+
+在项目根目录执行：
+
+```bash
+cd qianniu_get_data
+npm install
+```
+
+会安装 `playwright`、`xlsx` 等依赖。本工具通过 Playwright 驱动 **系统已安装的 Chrome**，一般 **不需要** 执行 `npx playwright install chromium`。
+
+#### 3. Google Chrome
+
+必须安装正式版 Chrome（千牛页面兼容性要求），脚本会自动探测常见安装路径。
+
+| 系统 | 安装方式 | 默认路径 |
+|------|---------|---------|
+| macOS | https://www.google.com/chrome/ | `/Applications/Google Chrome.app/...` |
+| Windows | https://www.google.com/chrome/ | `%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe` |
+| Linux | 发行版包管理器或官网 | `/usr/bin/google-chrome` |
+
+非默认路径时，设置环境变量：
+
+```bash
+# macOS / Linux
+export CHROME_PATH="/path/to/chrome"
+
+# Windows（系统环境变量或 bat 脚本中）
+set CHROME_PATH=C:\path\to\chrome.exe
+```
+
+#### 4. ffmpeg
+
+任务 2（`task-audio`）需要 ffmpeg 将 MP4 转为 MP3。
+
+| 系统 | 安装命令 | 说明 |
+|------|---------|------|
+| macOS | `brew install ffmpeg` | 需先安装 [Homebrew](https://brew.sh) |
+| Windows | 见下方 Windows 说明 | 推荐解压到 `C:\ffmpeg\` |
+| Linux (Debian/Ubuntu) | `sudo apt update && sudo apt install -y ffmpeg` | |
+| Linux (CentOS/RHEL) | `sudo yum install -y ffmpeg` 或启用 RPM Fusion 后安装 | |
+
+**Windows 安装 ffmpeg（推荐步骤）：**
+
+1. 从 https://www.gyan.dev/ffmpeg/builds/ 下载 `ffmpeg-release-essentials.zip`
+2. 解压到 `C:\ffmpeg\`，确保存在 `C:\ffmpeg\bin\ffmpeg.exe`
+3. 验证：打开 cmd 执行 `C:\ffmpeg\bin\ffmpeg.exe -version`
+
+若安装在其他目录，设置环境变量：
+
+```bat
+set FFMPEG_PATH=D:\tools\ffmpeg\bin\ffmpeg.exe
+```
+
+或将 `ffmpeg\bin` 加入系统 `PATH`，脚本也会自动尝试从 PATH 调用 `ffmpeg`。
+
+#### 5. 安装验证
+
+全部装好后，在项目目录执行：
+
+```bash
+node -v
+npm -v
+npm run verify-feishu    # 需先配置 .env
+```
+
+手动确认 Chrome、ffmpeg 可用：
+
+```bash
+# macOS / Linux
+"$CHROME_PATH" --version 2>/dev/null || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --version
+ffmpeg -version
+
+# Windows
+"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe" --version
+C:\ffmpeg\bin\ffmpeg.exe -version
+```
+
+### 环境变量
+
+**飞书自建应用凭证（必填）**
+
+```bash
+cp .env.example .env
+# 编辑 .env，填入 FEISHU_APP_ID 和 FEISHU_APP_SECRET
+```
+
+| 变量 | 说明 |
+|------|------|
+| `FEISHU_APP_ID` | 飞书开放平台自建应用的 App ID |
+| `FEISHU_APP_SECRET` | 飞书开放平台自建应用的 App Secret |
+
+`.env` 含敏感信息，已加入 `.gitignore`，**不要提交到 git**。
+
+**可选路径覆盖**
 
 ```bash
 # Chrome 路径（非默认安装时）
@@ -51,16 +158,50 @@ export FFMPEG_PATH="/opt/homebrew/bin/ffmpeg"
 
 ## 部署步骤
 
-### 1. 克隆并安装
+### 1. 克隆并安装依赖
 
 ```bash
 git clone https://github.com/IXYTYXI/qianniu_get_data.git
 cd qianniu_get_data
 npm install
-npx playwright install chromium   # 首次需要
 ```
 
-### 2. 配置飞书
+> 完整依赖说明（Node.js、Chrome、ffmpeg 各平台安装）见上文 **依赖安装说明**。
+
+### 2. 配置飞书自建应用
+
+本工具通过 **飞书开放平台自建应用** 调用多维表格 API，部署时无需安装 `lark-cli`，也无需个人扫码登录。
+
+#### 2.1 创建自建应用
+
+1. 打开 [飞书开放平台](https://open.feishu.cn/app) → **创建企业自建应用**
+2. 记录 **App ID**、**App Secret**（凭证与基础信息页）
+3. 在 **权限管理** 中开通以下权限，并提交 **版本发布** 由管理员审批：
+
+| 权限标识 | 用途 |
+|---------|------|
+| `bitable:app` | 读写多维表格 |
+| `base:record:retrieve` | 检索记录 |
+| `drive:drive` | 上传附件（音频分片上传） |
+
+4. 将 App ID / App Secret 写入 `.env`：
+
+```bash
+cp .env.example .env
+```
+
+```env
+FEISHU_APP_ID=cli_xxxxxxxxxxxxxxxx
+FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+5. 验证凭证与 API 连通性：
+
+```bash
+npm run verify-feishu
+```
+
+#### 2.2 配置多维表格
 
 ```bash
 cp feishu.config.example.json feishu.config.json
@@ -85,13 +226,11 @@ cp feishu.config.example.json feishu.config.json
 }
 ```
 
+**Base Token 获取方式：** 打开多维表格，浏览器地址栏中 `/base/` 后面即为 `baseToken`。各表的 `tableId` 可在表设置或 URL 中查看。
+
 每月新建 Base 后，更新 `feishu.config.json` 中的 `month`、`baseToken` 和各 `tableId`。
 
-确保 lark-cli 已授权：
-
-```bash
-lark-cli auth status
-```
+> **注意：** 自建应用使用 `tenant_access_token`，代表企业身份访问。请确保目标 Base 属于同一飞书企业，且应用权限已由管理员审批通过。
 
 ### 3. 首次登录千牛
 
@@ -225,6 +364,7 @@ npm run task-audio -- --date 2026-07-14 --audio-only
 ### 其他辅助命令
 
 ```bash
+npm run verify-feishu          # 验证飞书自建应用凭证与 Base 连通性
 npm run import-barrage          # 手动导入 downloads/ 下的弹幕 xlsx
 npm run export-audio -- --date 2026-07-14   # 仅导出音频，不上传
 ```
@@ -244,8 +384,11 @@ qianniu_get_data/
 ├── index.js             # 千牛浏览器操作核心
 ├── download-video.js    # 视频下载逻辑
 ├── audio.js             # ffmpeg 音频导出
-├── feishu.js            # 飞书多维表格读写
-├── feishu.config.json   # 飞书配置（本地，不提交 git）
+├── feishu.js            # 飞书多维表格业务逻辑
+├── feishu-api.js        # 飞书自建应用 API 封装
+├── verify-feishu.js     # 部署时验证飞书凭证
+├── .env.example         # 飞书凭证模板
+├── feishu.config.json   # 多维表格配置（本地，不提交 git）
 ├── .chrome-profile/     # Chrome 登录态（不提交 git）
 ├── downloads/
 │   ├── *.xlsx           # 弹幕文件（导入后自动删除）
@@ -291,7 +434,8 @@ npm run task-audio -- --date 2026-07-14 --skip-login
 
 ### 飞书上传失败
 
-- 确认 `lark-cli auth status` 正常
+- 先运行 `npm run verify-feishu`，确认 `.env` 凭证正确且权限已审批
+- 检查 `feishu.config.json` 中 `baseToken`、`tableId` 是否与当月 Base 一致
 - 大文件（>20MB）自动分片上传，需耐心等待
 - 原视频 MP4 可达数 GB，超过飞书单文件 2GB 上限；因此任务 2 改为上传 **音频**（约 800MB/场）
 

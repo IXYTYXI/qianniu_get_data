@@ -21,6 +21,12 @@ const CHROME_CANDIDATES = {
   ],
 };
 
+const FFMPEG_CANDIDATES = {
+  darwin: ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg'],
+  win32: ['C:\\ffmpeg\\bin\\ffmpeg.exe'],
+  linux: ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg'],
+};
+
 function resolveChromePath(customPath) {
   if (customPath && fs.existsSync(customPath)) {
     return customPath;
@@ -41,16 +47,6 @@ function resolveChromePath(customPath) {
   return candidates[0] || null;
 }
 
-function getLarkCliBin() {
-  return process.platform === 'win32' ? 'lark-cli.cmd' : 'lark-cli';
-}
-
-const FFMPEG_CANDIDATES = {
-  darwin: ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg'],
-  win32: ['C:\\ffmpeg\\bin\\ffmpeg.exe'],
-  linux: ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg'],
-};
-
 function resolveFfmpegPath(customPath) {
   if (customPath && fs.existsSync(customPath)) return customPath;
   const envPath = process.env.FFMPEG_PATH;
@@ -65,5 +61,4 @@ function resolveFfmpegPath(customPath) {
 module.exports = {
   resolveChromePath,
   resolveFfmpegPath,
-  getLarkCliBin,
 };
