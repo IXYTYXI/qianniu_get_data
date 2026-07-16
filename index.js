@@ -118,7 +118,11 @@ class QianniuDownloader {
       this.downloadedFiles.push(savePath);
       console.log(`  [完成] ${savePath}`);
 
-      if (/\.xlsx?$/i.test(filename) && (this.options.mode === 'all' || this.options.mode === 'barrage')) {
+      if (/\.xlsx?$/i.test(filename) && (
+        this.options.mode === 'all' ||
+        this.options.mode === 'barrage' ||
+        this.options.mode === 'barrage-task'
+      )) {
         await importBarrageToFeishu(savePath, hintText);
       }
     } catch (e) {
@@ -353,11 +357,11 @@ class QianniuDownloader {
       path: path.join(config.screenshotDir, `08-control-${liveId}.png`),
     });
 
-    if (this.options.mode === 'transcode' || this.options.mode === 'all') {
+    if (this.options.mode === 'transcode' || this.options.mode === 'all' || this.options.mode === 'barrage-task') {
       await this.triggerTranscode(targetPage, liveId);
     }
 
-    if (this.options.mode === 'all' || this.options.mode === 'barrage') {
+    if (this.options.mode === 'all' || this.options.mode === 'barrage' || this.options.mode === 'barrage-task') {
       await this.exportBarrage(targetPage, liveId, rowText);
     }
 

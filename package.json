@@ -4,10 +4,16 @@
   "description": "千牛直播视频和弹幕自动下载工具",
   "main": "index.js",
   "scripts": {
+    "task-barrage": "node task-barrage.js",
+    "task-audio": "node task-audio.js",
     "start": "node index.js",
     "video": "node index.js --mode video",
     "barrage": "node index.js --mode barrage",
     "transcode": "node index.js --mode transcode",
+    "download-video": "node download-video.js",
+    "upload-video": "node download-video.js --upload-only",
+    "export-audio": "node export-audio.js",
+    "upload-audio": "node export-audio.js --upload",
     "import-barrage": "node import-barrage.js"
   },
   "dependencies": {

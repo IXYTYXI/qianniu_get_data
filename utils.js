@@ -45,7 +45,25 @@ function getLarkCliBin() {
   return process.platform === 'win32' ? 'lark-cli.cmd' : 'lark-cli';
 }
 
+const FFMPEG_CANDIDATES = {
+  darwin: ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg'],
+  win32: ['C:\\ffmpeg\\bin\\ffmpeg.exe'],
+  linux: ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg'],
+};
+
+function resolveFfmpegPath(customPath) {
+  if (customPath && fs.existsSync(customPath)) return customPath;
+  const envPath = process.env.FFMPEG_PATH;
+  if (envPath && fs.existsSync(envPath)) return envPath;
+  const candidates = FFMPEG_CANDIDATES[process.platform] || [];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return 'ffmpeg';
+}
+
 module.exports = {
   resolveChromePath,
+  resolveFfmpegPath,
   getLarkCliBin,
 };
