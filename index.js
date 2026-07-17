@@ -590,7 +590,9 @@ class QianniuDownloader {
 
     if (/转码中|处理中|请稍后/.test(btnText)) {
       console.log(`  直播 ${liveId} 已在转码中，不点击`);
-    } else if (/转码|开始|下载/.test(btnText)) {
+    } else if (/网页直接下载|下载MP4|下载.*视频/.test(btnText)) {
+      console.log(`  视频已可下载（${btnText}），任务1仅触发转码不下载，跳过`);
+    } else if (/转码|开始/.test(btnText)) {
       await this.clickWhenReady(actionBtn, '转码按钮', { waitMs: 2000 });
     } else {
       console.log('  未识别转码按钮状态，不点击');

@@ -152,7 +152,7 @@ async function ensureDailySeqField(appToken, tableId, tableName) {
   }
 }
 
-async function buildImportRows(headers, dataRows) {
+function buildImportRows(headers, dataRows) {
   const timeIdx = headers.indexOf('时间');
   const filteredHeaders = headers.filter(
     (h) => h && !SKIP_IMPORT_COLUMNS.has(h) && h !== SEQ_FIELD
