@@ -5,8 +5,8 @@ const { execSync } = require('child_process');
 const config = require('./config');
 const { getTodayUTC8 } = require('./dates');
 
-function ensureChromeProfileFree() {
-  const profile = config.userDataDir;
+function ensureChromeProfileFree(profileDir = config.userDataDir) {
+  const profile = profileDir;
   try {
     execSync(`pkill -f "user-data-dir=${profile}"`, { stdio: 'ignore' });
   } catch {
@@ -33,11 +33,14 @@ async function launchBrowser() {
   fs.mkdirSync(config.videoDownloadDir, { recursive: true });
   fs.mkdirSync(config.screenshotDir, { recursive: true });
 
-  ensureChromeProfileFree();
+  const headless = process.env.PLAYWRIGHT_HEADLESS === '1' || process.env.PLAYWRIGHT_HEADLESS === 'true';
+  const userDataDir = process.env.CHROME_USER_DATA_DIR || config.userDataDir;
+
+  ensureChromeProfileFree(userDataDir);
   await new Promise((r) => setTimeout(r, 1500));
 
-  const context = await chromium.launchPersistentContext(config.userDataDir, {
-    headless: false,
+  const context = await chromium.launchPersistentContext(userDataDir, {
+    headless,
     executablePath: config.chromePath,
     viewport: { width: 1400, height: 900 },
     args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],

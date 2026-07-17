@@ -370,10 +370,12 @@ function findLiveRowsFromLocal(targetDate) {
   }).filter(Boolean);
 }
 
-main().catch((err) => {
-  console.error('执行失败:', err.message);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error('执行失败:', err.message);
+    process.exit(1);
+  });
+}
 
 module.exports = {
   openControlCenter,
