@@ -49,7 +49,10 @@ async function downloadAllVideos(options, targetDate) {
 
   try {
     const loggedIn = await waitForLogin(page, options);
-    if (!loggedIn) return downloadResults;
+    if (!loggedIn) {
+      console.error('未登录且设置了 --skip-login，任务终止');
+      process.exit(1);
+    }
 
     await page.goto(config.centerUrl, { timeout: config.navigationTimeout });
     await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
@@ -163,6 +166,9 @@ async function main() {
     console.log('\n浏览器保持打开，按 Ctrl+C 退出');
     await new Promise(() => {});
   }
+
+  console.log('EXIT_CODE: 0');
+  process.exit(0);
 }
 
 if (require.main === module) {

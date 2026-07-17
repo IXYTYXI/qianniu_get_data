@@ -659,8 +659,9 @@ class QianniuDownloader {
 
       const loggedIn = await this.waitForLogin();
       if (!loggedIn) {
-        console.log('登录未完成，退出。');
-        return;
+        console.error('未登录且设置了 --skip-login，任务终止');
+        await this.close();
+        process.exit(1);
       }
 
       await this.navigateToCenter();
@@ -707,6 +708,8 @@ class QianniuDownloader {
 
       await this.screenshot('99-final');
       await this.close();
+      console.log('EXIT_CODE: 0');
+      process.exit(0);
     } catch (error) {
       console.error('错误:', error.message);
       await this.screenshot('99-error').catch(() => {});
