@@ -27,7 +27,7 @@ function exportAudioFromVideo(videoPath, options = {}) {
   }
   if (!checkFfmpeg()) {
     throw new Error(
-      '未找到 ffmpeg，请先安装:\n  Mac: brew install ffmpeg\n  或设置 FFMPEG_PATH 环境变量'
+      `未找到 ffmpeg: ${config.ffmpegPath}\n请在 .env 中设置 FFMPEG_PATH 或安装 ffmpeg`
     );
   }
 
@@ -69,7 +69,7 @@ function listVideosForDate(targetDate) {
 function parseVideoFilename(filename) {
   const m = path.basename(filename).match(/^(\d{4}-\d{2}-\d{2})_(\d{6})_(.+)\.mp4$/i);
   if (!m) return null;
-  return { date: m[1], id: m[2], name: m[3] };
+  return { date: m[1], id: m[2], name: m[3].replace(/_/g, ' ') };
 }
 
 module.exports = {

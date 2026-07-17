@@ -130,9 +130,10 @@ async function waitForFileReady(filePath, timeoutMs = config.videoFileReadyTimeo
 async function downloadTranscodedVideo(targetPage, live) {
   console.log(`检查转码状态: ${live.id} ${live.name}`);
 
-  const replayDownload = targetPage
-    .locator('li.tabs:has-text("回放下载"), span:has-text("回放下载")')
-    .first();
+  const replayDownload = targetPage.locator(
+    '.nav-list li:has-text("回放下载"), .sidebar li:has-text("回放下载"), ' +
+    '.left-nav :text-is("回放下载"), li.tabs:has-text("回放下载"), span:has-text("回放下载")'
+  ).first();
   if (!(await replayDownload.isVisible({ timeout: 5000 }).catch(() => false))) {
     console.log('未找到「回放下载」菜单');
     return { status: 'no_menu' };
@@ -141,9 +142,14 @@ async function downloadTranscodedVideo(targetPage, live) {
   await replayDownload.click();
   await targetPage.waitForTimeout(2000);
 
-  const dialog = targetPage.locator('.el-dialog__wrapper').filter({ hasText: '下载视频' }).last();
+  const dialog = targetPage.locator('.el-dialog__wrapper:visible').filter({ hasText: '下载视频' }).last();
+  if (!(await dialog.isVisible({ timeout: 5000 }).catch(() => false))) {
+    console.log('未弹出「下载视频」对话框');
+    return { status: 'no_dialog' };
+  }
+
   const actionBtn = dialog.locator('.el-dialog__body button').first();
-  const btnText = ((await actionBtn.textContent().catch(() => '')) || '').trim();
+  const btnText = ((await actionBtn.textContent().catch(() => '')) || '').replace(/\s+/g, ' ').trim();
 
   if (!btnText) {
     console.log('未找到下载按钮');
@@ -151,10 +157,24 @@ async function downloadTranscodedVideo(targetPage, live) {
     return { status: 'no_button' };
   }
 
-  if (btnText.includes('转码中')) {
+  console.log(`  下载按钮状态: 「${btnText}」`);
+
+  if (/转码中|处理中|请稍后/.test(btnText)) {
     console.log(`直播 ${live.id} 仍在转码中，跳过`);
     await closeDialog(dialog);
     return { status: 'transcoding' };
+  }
+
+  if (/^开始|发起|点击转码/.test(btnText) || (/转码/.test(btnText) && !/下载/.test(btnText))) {
+    console.log(`直播 ${live.id} 尚未转码完成（${btnText}），跳过`);
+    await closeDialog(dialog);
+    return { status: 'not_ready', btnText };
+  }
+
+  if (!/网页直接下载|下载MP4|下载.*视频/.test(btnText)) {
+    console.log(`直播 ${live.id} 按钮状态不可下载: ${btnText}`);
+    await closeDialog(dialog);
+    return { status: 'unknown_button', btnText };
   }
 
   if (await actionBtn.isDisabled().catch(() => false)) {
@@ -267,7 +287,10 @@ async function main() {
 
   try {
     const loggedIn = await waitForLogin(page, options);
-    if (!loggedIn) return;
+    if (!loggedIn) {
+      console.error('未登录且设置了 --skip-login，任务终止');
+      process.exit(1);
+    }
 
     await page.goto(config.centerUrl, { timeout: config.navigationTimeout });
     await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});

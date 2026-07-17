@@ -80,15 +80,15 @@ async function downloadAllVideos(options, targetDate) {
   return downloadResults;
 }
 
-async function exportAndUploadAudio(targetDate) {
+async function exportAndUploadAudio(targetDate, liveMetaById = {}) {
   if (!checkFfmpeg()) {
-    throw new Error('未找到 ffmpeg，请先安装: brew install ffmpeg');
+    throw new Error(`未找到 ffmpeg: ${config.ffmpegPath}`);
   }
 
   const videos = listVideosForDate(targetDate);
   if (!videos.length) {
     console.log(`未找到 ${targetDate} 的本地视频`);
-    return { exportResults: [], uploadSummary: [] };
+    return { exportResults: [], uploadSummary: [], videoCount: 0 };
   }
 
   console.log(`\n=== 阶段 2: 导出音频（共 ${videos.length} 个）===\n`);
@@ -96,13 +96,15 @@ async function exportAndUploadAudio(targetDate) {
   for (let i = 0; i < videos.length; i++) {
     const videoPath = videos[i];
     const meta = parseVideoFilename(videoPath);
+    const live = meta?.id ? liveMetaById[meta.id] : null;
+    const displayName = live?.name || meta?.name || (meta?.id ? `直播${meta.id}` : path.basename(videoPath));
     console.log(`--- [${i + 1}/${videos.length}] ${meta?.id || path.basename(videoPath)} ---`);
     try {
       const result = exportAudioFromVideo(videoPath);
-      exportResults.push({ ...meta, ...result });
+      exportResults.push({ ...meta, name: displayName, ...result });
     } catch (err) {
       console.log(`  导出失败: ${err.message}`);
-      exportResults.push({ ...meta, status: 'error', error: err.message });
+      exportResults.push({ ...meta, name: displayName, status: 'error', error: err.message });
     }
   }
 
@@ -128,7 +130,7 @@ async function exportAndUploadAudio(targetDate) {
     }
   }
 
-  return { exportResults, uploadSummary };
+  return { exportResults, uploadSummary, videoCount: videos.length };
 }
 
 async function main() {
@@ -144,7 +146,15 @@ async function main() {
     downloadResults = await downloadAllVideos(options, targetDate);
   }
 
-  const { exportResults, uploadSummary } = await exportAndUploadAudio(targetDate);
+  const liveMetaById = {};
+  for (const item of downloadResults) {
+    if (item.live) liveMetaById[item.liveId] = item.live;
+  }
+
+  const { exportResults, uploadSummary, videoCount } = await exportAndUploadAudio(
+    targetDate,
+    liveMetaById
+  );
 
   console.log('\n=== 执行摘要 ===');
   if (!options.audioOnly) {
@@ -159,12 +169,26 @@ async function main() {
   }
 
   const downloaded = downloadResults.filter((s) => s.status === 'downloaded').length;
+  const transcoding = downloadResults.filter((s) => s.status === 'transcoding' || s.status === 'not_ready').length;
   const uploaded = uploadSummary.filter((s) => s.status === 'success').length;
-  console.log(`\n下载完成 ${downloaded}，音频上传成功 ${uploaded}`);
+  const skipped = uploadSummary.filter((s) => s.status === 'skipped').length;
+  console.log(`\n下载完成 ${downloaded}，转码未完成 ${transcoding}，音频上传成功 ${uploaded}，已跳过 ${skipped}`);
 
   if (options.keepBrowser) {
     console.log('\n浏览器保持打开，按 Ctrl+C 退出');
     await new Promise(() => {});
+    return;
+  }
+
+  const hadVideos = videoCount > 0;
+  const uploadDone = uploaded > 0 || skipped > 0;
+  if (hadVideos && !uploadDone) {
+    console.error('有视频但音频均未上传成功');
+    process.exit(1);
+  }
+  if (!options.audioOnly && downloadResults.length > 0 && downloaded === 0 && transcoding === downloadResults.length) {
+    console.error('所有场次仍在转码中，请稍后重跑任务 2');
+    process.exit(1);
   }
 
   console.log('EXIT_CODE: 0');
