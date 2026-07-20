@@ -7,20 +7,43 @@ const { getTodayUTC8 } = require('./dates');
 
 function ensureChromeProfileFree(profileDir = config.userDataDir) {
   const profile = profileDir;
-  try {
-    execSync(`pkill -f "user-data-dir=${profile}"`, { stdio: 'ignore' });
-  } catch {
-    // no running chrome
+  fs.mkdirSync(profile, { recursive: true });
+
+  if (process.platform === 'win32') {
+    const escaped = profile.replace(/'/g, "''");
+    try {
+      execSync(
+        'powershell -NoProfile -Command '
+        + `"Get-CimInstance Win32_Process -Filter \\"Name='chrome.exe'\\" `
+        + `| Where-Object { $_.CommandLine -like '*${escaped}*' } `
+        + `| ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"`,
+        { stdio: 'ignore', timeout: 15000 }
+      );
+    } catch {
+      // no running chrome
+    }
+  } else {
+    try {
+      execSync(`pkill -f "user-data-dir=${profile}"`, { stdio: 'ignore' });
+    } catch {
+      // no running chrome
+    }
   }
 
+  const removedLocks = [];
   for (const name of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
     const lockPath = path.join(profile, name);
     try {
       fs.lstatSync(lockPath);
       fs.unlinkSync(lockPath);
+      removedLocks.push(name);
     } catch {
       // not present
     }
+  }
+
+  if (removedLocks.length > 0) {
+    console.log(`Chrome Profile 启动前清理: 已删除锁文件 ${removedLocks.join(', ')}`);
   }
 }
 
@@ -97,52 +120,136 @@ async function filterByDate(page, targetDate) {
   }
 
   await startInput.click();
+  await startInput.fill('');
   await startInput.fill(targetDate);
   await endInput.click();
+  await endInput.fill('');
   await endInput.fill(targetDate);
   await endInput.press('Enter');
 
-  const searchBtn = page.locator('button:has-text("搜索"), button:has-text("查询")').first();
+  const searchBtn = page.locator(
+    'button:has-text("搜索"), button:has-text("查询"), button:has-text("筛选")'
+  ).first();
   if (await searchBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
     await searchBtn.click();
   }
-  await page.waitForTimeout(3000);
+  await page.waitForTimeout(4000);
 }
 
 function getTableRows(page) {
   return page.locator('table tbody tr, .ant-table-tbody tr, .el-table__body-wrapper tr');
 }
 
-async function findLiveRows(page, targetDate) {
+async function goToFirstPage(page) {
+  const firstPageBtn = page.locator(
+    '.el-pagination .number:text-is("1"), ' +
+    '.el-pagination .number >> nth=0, ' +
+    '.ant-pagination-item-1'
+  ).first();
+  if (await firstPageBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
+    await firstPageBtn.click();
+    await page.waitForTimeout(2000);
+  }
+}
+
+async function clickNextPage(page) {
+  const nextBtn = page.locator(
+    '.el-pagination button.btn-next:not([disabled]), ' +
+    '.el-pagination .btn-next:not(.disabled), ' +
+    '.ant-pagination-next:not(.ant-pagination-disabled), ' +
+    'button:has-text("下一页"), ' +
+    'li.number + li.btn-next:not(.disabled) button'
+  ).first();
+
+  if (!(await nextBtn.isVisible({ timeout: 1500 }).catch(() => false))) {
+    return false;
+  }
+  if (await nextBtn.isDisabled().catch(() => false)) {
+    return false;
+  }
+
+  await nextBtn.click();
+  await page.waitForTimeout(2500);
+  return true;
+}
+
+function parseLiveFromRowText(text, targetDate) {
+  if (!text.includes(targetDate)) return null;
+
+  const id = text.match(/(\d{6})(?=\d{4}-\d{2}-\d{2})/)?.[1] || text.match(/(\d{6})/)?.[1];
+  if (!id) return null;
+
+  const nameMatch = text.match(/【[^】]+】[^0-9]*/);
+  const timeMatch = text.match(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/);
+  return {
+    id,
+    name: (nameMatch?.[0] || '').trim(),
+    startTime: timeMatch?.[0] || targetDate,
+    date: (timeMatch?.[0] || targetDate).slice(0, 10),
+    rowText: text,
+  };
+}
+
+async function collectLiveRowsFromCurrentPage(page, targetDate, seen, lives) {
   const allRows = getTableRows(page);
   const rowCount = await allRows.count();
-  const seen = new Set();
-  const lives = [];
 
   for (let i = 0; i < rowCount; i++) {
     const row = allRows.nth(i);
     const text = (await row.textContent().catch(() => '')) || '';
-    if (!text.includes(targetDate)) continue;
+    const live = parseLiveFromRowText(text, targetDate);
+    if (!live || seen.has(live.id)) continue;
+    seen.add(live.id);
+    lives.push(live);
+  }
+}
 
-    const id = text.match(/(\d{6})(?=\d{4}-\d{2}-\d{2})/)?.[1] || text.match(/(\d{6})/)?.[1];
-    if (!id || seen.has(id)) continue;
-    seen.add(id);
+async function currentPageHasTargetDate(page, targetDate) {
+  const allRows = getTableRows(page);
+  const rowCount = await allRows.count();
+  for (let i = 0; i < rowCount; i++) {
+    const text = (await allRows.nth(i).textContent().catch(() => '')) || '';
+    if (text.includes(targetDate)) return true;
+  }
+  return false;
+}
 
-    const nameMatch = text.match(/【[^】]+】[^0-9]*/);
-    const timeMatch = text.match(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/);
-    lives.push({
-      id,
-      name: (nameMatch?.[0] || '').trim(),
-      startTime: timeMatch?.[0] || targetDate,
-      date: (timeMatch?.[0] || targetDate).slice(0, 10),
-      rowText: text,
-    });
+async function findLiveRows(page, targetDate) {
+  const seen = new Set();
+  const lives = [];
+
+  await goToFirstPage(page);
+  await collectLiveRowsFromCurrentPage(page, targetDate, seen, lives);
+  console.log(`  列表第 1 页: 累计匹配 ${lives.length} 场 (${targetDate})`);
+
+  // 定时任务（日期筛选后）：第一页通常已包含全部目标场次
+  if (lives.length > 0) {
+    console.log('  第 1 页已找到，跳过翻页');
+    console.log(`共找到 ${lives.length} 场: ${lives.map((l) => l.id).join(', ')}`);
+    return lives;
+  }
+
+  // 补跑历史日期：第一页无匹配时再翻页
+  console.log('  第 1 页无匹配，开始翻页查找（补跑）');
+  for (let pageNum = 2; pageNum <= 50; pageNum += 1) {
+    const hasNext = await clickNextPage(page);
+    if (!hasNext) break;
+
+    const hasDateOnPage = await currentPageHasTargetDate(page, targetDate);
+    await collectLiveRowsFromCurrentPage(page, targetDate, seen, lives);
+    console.log(`  列表第 ${pageNum} 页: 累计匹配 ${lives.length} 场 (${targetDate})`);
+
+    if (!hasDateOnPage && lives.length > 0) break;
+  }
+
+  if (lives.length > 0) {
+    console.log(`共找到 ${lives.length} 场: ${lives.map((l) => l.id).join(', ')}`);
   }
 
   return lives;
 }
 
-async function findRowByLiveId(page, liveId) {
+async function findRowByLiveIdOnCurrentPage(page, liveId) {
   const allRows = getTableRows(page);
   const rowCount = await allRows.count();
   let fallback = null;
@@ -165,6 +272,23 @@ async function findRowByLiveId(page, liveId) {
   return fallback;
 }
 
+async function findRowByLiveId(page, liveId) {
+  await goToFirstPage(page);
+
+  let row = await findRowByLiveIdOnCurrentPage(page, liveId);
+  if (row) return row;
+
+  // 补跑时目标可能在后续页
+  for (let pageNum = 2; pageNum <= 50; pageNum += 1) {
+    const hasNext = await clickNextPage(page);
+    if (!hasNext) break;
+    row = await findRowByLiveIdOnCurrentPage(page, liveId);
+    if (row) return row;
+  }
+
+  return null;
+}
+
 function printBanner(title, targetDate) {
   console.log(`=== ${title} ===`);
   console.log(`东八区今日: ${getTodayUTC8()}`);
@@ -178,5 +302,6 @@ module.exports = {
   filterByDate,
   findLiveRows,
   findRowByLiveId,
+  goToFirstPage,
   printBanner,
 };
