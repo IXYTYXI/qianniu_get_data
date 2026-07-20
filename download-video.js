@@ -22,6 +22,7 @@ const {
   findLiveRows,
   findRowByLiveId,
   printBanner,
+  goToFirstPage,
 } = require('./browser');
 const { uploadVideoToFeishu } = require('./feishu');
 
@@ -96,10 +97,11 @@ function findLocalVideo(live) {
   return match ? path.join(dir, match) : null;
 }
 
-async function waitForFileReady(filePath, timeoutMs = config.videoFileReadyTimeout) {
+async function waitForFileReady(filePath, timeoutMs = config.videoFileReadyTimeout, liveId = '') {
   const start = Date.now();
   let lastSize = -1;
   let stableCount = 0;
+  const tag = liveId ? `[${liveId}] ` : '';
 
   while (Date.now() - start < timeoutMs) {
     if (!fs.existsSync(filePath)) {
@@ -115,7 +117,7 @@ async function waitForFileReady(filePath, timeoutMs = config.videoFileReadyTimeo
       lastSize = size;
       if (size > 0) {
         const mb = (size / 1024 / 1024).toFixed(1);
-        process.stdout.write(`\r  下载中... ${mb} MB`);
+        console.log(`  ${tag}下载中... ${mb} MB`);
       }
     }
     await new Promise((r) => setTimeout(r, 2000));
@@ -127,7 +129,19 @@ async function waitForFileReady(filePath, timeoutMs = config.videoFileReadyTimeo
   throw new Error(`视频文件未就绪: ${filePath}`);
 }
 
-async function downloadTranscodedVideo(targetPage, live) {
+async function returnToLiveList(page, targetDate) {
+  await page.goto(config.centerUrl, { timeout: config.navigationTimeout });
+  await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  await filterByDate(page, targetDate);
+  await goToFirstPage(page);
+}
+
+/**
+ * 检查转码状态并点击下载；saveAs 在后台进行，不阻塞返回。
+ * 返回 downloaded（本地已有）| downloading（含 promise）| 其他跳过状态。
+ */
+async function triggerVideoDownload(targetPage, live) {
   console.log(`检查转码状态: ${live.id} ${live.name}`);
 
   const replayDownload = targetPage.locator(
@@ -191,39 +205,70 @@ async function downloadTranscodedVideo(targetPage, live) {
     return { status: 'downloaded', filePath: existingPath, skippedDownload: true };
   }
 
-  console.log(`开始下载: ${btnText}（浏览器保持打开，请勿手动关闭）`);
+  console.log(`  [${live.id}] 发起下载: ${btnText}`);
   const [download] = await Promise.all([
     targetPage.waitForEvent('download', { timeout: config.videoDownloadTimeout }),
     actionBtn.click(),
   ]);
 
   const savePath = buildVideoPath(live, download.suggestedFilename());
-  await download.saveAs(savePath);
-  const size = await waitForFileReady(savePath);
   await closeDialog(dialog);
-  process.stdout.write('\n');
-  const sizeMb = (size / 1024 / 1024).toFixed(1);
-  console.log(`  视频已保存: ${savePath} (${sizeMb} MB)`);
 
-  return { status: 'downloaded', filePath: savePath };
+  const promise = (async () => {
+    try {
+      await download.saveAs(savePath);
+      const size = await waitForFileReady(savePath, config.videoFileReadyTimeout, live.id);
+      const sizeMb = (size / 1024 / 1024).toFixed(1);
+      console.log(`  [${live.id}] 视频已保存: ${savePath} (${sizeMb} MB)`);
+      return { status: 'downloaded', filePath: savePath };
+    } catch (err) {
+      console.log(`  [${live.id}] 下载失败: ${err.message}`);
+      return { status: 'error', error: err.message, filePath: savePath };
+    }
+  })();
+
+  console.log(`  [${live.id}] 下载已在后台进行，继续下一场...`);
+  return { status: 'downloading', filePath: savePath, promise };
 }
 
-async function downloadLive(context, page, live) {
+/** 阻塞式单场下载（兼容旧调用） */
+async function downloadTranscodedVideo(targetPage, live) {
+  const result = await triggerVideoDownload(targetPage, live);
+  if (result.promise) {
+    return result.promise;
+  }
+  return result;
+}
+
+async function triggerDownloadLive(context, page, live, targetDate) {
   const targetPage = await openControlCenter(context, page, live);
   if (!targetPage) return { liveId: live.id, status: 'no_control', live };
 
+  const openedNewTab = targetPage !== page;
+
   try {
-    const result = await downloadTranscodedVideo(targetPage, live);
+    const result = await triggerVideoDownload(targetPage, live);
     return { liveId: live.id, live, ...result };
   } catch (err) {
-    console.log(`  下载失败: ${err.message}`);
+    console.log(`  [${live.id}] 触发下载失败: ${err.message}`);
     return { liveId: live.id, live, status: 'error', error: err.message };
   } finally {
-    if (targetPage !== page && !targetPage.isClosed()) {
-      await targetPage.waitForTimeout(1000);
+    if (openedNewTab && !targetPage.isClosed()) {
       await targetPage.close().catch(() => {});
+      await page.bringToFront().catch(() => {});
+    } else if (!openedNewTab && targetDate) {
+      await returnToLiveList(page, targetDate);
     }
   }
+}
+
+async function downloadLive(context, page, live, targetDate) {
+  const result = await triggerDownloadLive(context, page, live, targetDate);
+  if (result.promise) {
+    const completed = await result.promise;
+    return { liveId: live.id, live, ...completed };
+  }
+  return result;
 }
 
 async function uploadDownloadedVideos(downloadResults) {
@@ -244,6 +289,7 @@ async function uploadDownloadedVideos(downloadResults) {
       const uploadResult = await uploadVideoToFeishu({
         date: live.date,
         name: live.name || `直播${live.id}`,
+        liveId: live.id,
         filePath: item.filePath,
       });
       uploadSummary.push({
@@ -279,8 +325,8 @@ async function main() {
     return;
   }
 
-  console.log('流程: 阶段1 下载全部视频 → 关闭浏览器 → 阶段2 统一上传飞书');
-  console.log('提示: 下载过程中会保持浏览器和中控台页面打开，请勿手动关闭\n');
+  console.log('流程: 连续发起下载（后台并行）→ 全部下完后关闭浏览器 → 统一上传飞书');
+  console.log('提示: 请勿手动关闭浏览器，下载会在后台继续\n');
 
   const { context, page } = await launchBrowser();
   let downloadResults = [];
@@ -304,12 +350,33 @@ async function main() {
       return;
     }
 
-    console.log(`=== 阶段 1: 下载视频（共 ${lives.length} 场）===\n`);
+    await filterByDate(page, targetDate);
+    await goToFirstPage(page);
 
+    console.log(`=== 阶段 1: 发起下载（共 ${lives.length} 场，后台并行）===\n`);
+
+    const pendingDownloads = [];
     for (let i = 0; i < lives.length; i++) {
       console.log(`\n--- [${i + 1}/${lives.length}] 直播 ${lives[i].id} ---`);
-      const result = await downloadLive(context, page, lives[i]);
-      downloadResults.push(result);
+      const result = await triggerDownloadLive(context, page, lives[i], targetDate);
+      if (result.promise) {
+        pendingDownloads.push(
+          result.promise.then((completed) => ({ liveId: lives[i].id, live: lives[i], ...completed }))
+        );
+        downloadResults.push({ liveId: lives[i].id, live: lives[i], status: 'downloading' });
+      } else {
+        downloadResults.push(result);
+      }
+    }
+
+    if (pendingDownloads.length) {
+      console.log(`\n等待 ${pendingDownloads.length} 个后台下载完成...`);
+      const completed = await Promise.all(pendingDownloads);
+      for (const item of completed) {
+        const idx = downloadResults.findIndex((d) => d.liveId === item.liveId);
+        if (idx >= 0) downloadResults[idx] = item;
+        else downloadResults.push(item);
+      }
     }
   } finally {
     if (!options.keepBrowser) {
@@ -379,8 +446,11 @@ if (require.main === module) {
 
 module.exports = {
   openControlCenter,
+  triggerVideoDownload,
+  triggerDownloadLive,
   downloadTranscodedVideo,
   downloadLive,
   buildVideoPath,
   findLocalVideo,
+  returnToLiveList,
 };

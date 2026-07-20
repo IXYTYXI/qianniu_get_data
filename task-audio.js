@@ -19,9 +19,10 @@ const {
   filterByDate,
   findLiveRows,
   printBanner,
+  goToFirstPage,
 } = require('./browser');
 const {
-  downloadLive,
+  triggerDownloadLive,
 } = require('./download-video');
 const {
   exportAudioFromVideo,
@@ -43,9 +44,69 @@ function parseOptions(argv) {
   return options;
 }
 
-async function downloadAllVideos(options, targetDate) {
+async function exportAndUploadOne(meta, displayName, { awaitUpload = true } = {}) {
+  const uploadSummary = [];
+  const exportResults = [];
+  console.log(`--- ${meta?.id || path.basename(meta?.videoPath || '')} ---`);
+  try {
+    const result = exportAudioFromVideo(meta.videoPath);
+    const item = { ...meta, name: displayName, ...result };
+    exportResults.push(item);
+    if (!item.outputPath) return { exportResults, uploadSummary };
+
+    console.log(`  上传飞书: ${item.id}${awaitUpload ? '' : '（后台）'}`);
+    const uploadPromise = uploadAudioToFeishu({
+      date: item.date,
+      name: item.name,
+      liveId: item.id,
+      filePath: item.outputPath,
+    }).then((upload) => {
+      uploadSummary.push({
+        id: item.id,
+        status: upload.skipped ? 'skipped' : 'success',
+      });
+      return upload;
+    }).catch((err) => {
+      console.log(`  [${item.id}] 上传失败: ${err.message}`);
+      uploadSummary.push({ id: item.id, status: 'error', error: err.message });
+      throw err;
+    });
+
+    if (awaitUpload) {
+      await uploadPromise;
+    }
+    return { exportResults, uploadSummary, uploadPromise: awaitUpload ? null : uploadPromise };
+  } catch (err) {
+    console.log(`  失败: ${err.message}`);
+    exportResults.push({ ...meta, name: displayName, status: 'error', error: err.message });
+    uploadSummary.push({ id: meta?.id, status: 'error', error: err.message });
+  }
+  return { exportResults, uploadSummary };
+}
+
+function schedulePostDownload(live, filePath, uploadSummary, uploadTasks) {
+  const meta = parseVideoFilename(filePath);
+  const displayName = live.name || meta?.name || `直播${live.id}`;
+  return exportAndUploadOne(
+    { ...meta, videoPath: filePath },
+    displayName,
+    { awaitUpload: false }
+  ).then(({ uploadPromise }) => {
+    if (uploadPromise) {
+      uploadTasks.add(uploadPromise);
+      uploadPromise.finally(() => uploadTasks.delete(uploadPromise));
+    }
+  });
+}
+
+async function processLivesPipeline(options, targetDate) {
+  if (!checkFfmpeg()) {
+    throw new Error(`未找到 ffmpeg: ${config.ffmpegPath}`);
+  }
+
   const { context, page } = await launchBrowser();
   const downloadResults = [];
+  const uploadSummary = [];
 
   try {
     const loggedIn = await waitForLogin(page, options);
@@ -62,22 +123,79 @@ async function downloadAllVideos(options, targetDate) {
     const lives = await findLiveRows(page, targetDate);
     if (!lives.length) {
       console.log(`未找到 ${targetDate} 的直播记录`);
-      return downloadResults;
+      return { downloadResults, uploadSummary, videoCount: 0 };
     }
 
-    console.log(`=== 阶段 1: 下载视频（共 ${lives.length} 场）===\n`);
+    await filterByDate(page, targetDate);
+    await goToFirstPage(page);
+
+    console.log(`=== 流水线：连续发起下载，下完即转音频并上传（共 ${lives.length} 场）===\n`);
+
+    const downloadPromises = [];
+    const postProcessTasks = [];
+    const uploadTasks = new Set();
+
     for (let i = 0; i < lives.length; i++) {
-      console.log(`\n--- [${i + 1}/${lives.length}] 直播 ${lives[i].id} ---`);
-      downloadResults.push(await downloadLive(context, page, lives[i]));
+      const live = lives[i];
+      console.log(`\n--- [${i + 1}/${lives.length}] 发起下载 ${live.id} ---`);
+
+      const dl = await triggerDownloadLive(context, page, live, targetDate);
+
+      if (dl.status === 'downloaded' && dl.filePath) {
+        downloadResults.push({ liveId: live.id, live, ...dl });
+        postProcessTasks.push(schedulePostDownload(live, dl.filePath, uploadSummary, uploadTasks));
+        continue;
+      }
+
+      if (dl.status === 'downloading' && dl.promise) {
+        downloadResults.push({ liveId: live.id, live, status: 'downloading' });
+        downloadPromises.push(
+          dl.promise.then((completed) => {
+            const idx = downloadResults.findIndex((d) => d.liveId === live.id);
+            if (idx >= 0) {
+              downloadResults[idx] = { liveId: live.id, live, ...completed };
+            }
+            if (completed.status === 'downloaded' && completed.filePath) {
+              console.log(`\n--- ${live.id} 下载完成，开始转音频 ---`);
+              postProcessTasks.push(
+                schedulePostDownload(live, completed.filePath, uploadSummary, uploadTasks)
+              );
+            }
+            return completed;
+          })
+        );
+        continue;
+      }
+
+      downloadResults.push({ liveId: live.id, live, ...dl });
+    }
+
+    if (downloadPromises.length) {
+      console.log(`\n${downloadPromises.length} 个下载在后台进行，等待全部落盘...`);
+      await Promise.all(downloadPromises);
+    }
+
+    if (postProcessTasks.length) {
+      console.log('\n等待转音频任务完成...');
+      await Promise.all(postProcessTasks);
+    }
+
+    if (uploadTasks.size) {
+      console.log(`等待 ${uploadTasks.size} 个飞书上传完成...`);
+      await Promise.all([...uploadTasks]);
     }
   } finally {
     if (!options.keepBrowser) {
-      console.log('\n全部下载结束，关闭浏览器...');
+      console.log('\n全部处理结束，关闭浏览器...');
       await context.close().catch(() => {});
     }
   }
 
-  return downloadResults;
+  return {
+    downloadResults,
+    uploadSummary,
+    videoCount: downloadResults.filter((d) => d.status === 'downloaded').length,
+  };
 }
 
 async function exportAndUploadAudio(targetDate, liveMetaById = {}) {
@@ -91,43 +209,22 @@ async function exportAndUploadAudio(targetDate, liveMetaById = {}) {
     return { exportResults: [], uploadSummary: [], videoCount: 0 };
   }
 
-  console.log(`\n=== 阶段 2: 导出音频（共 ${videos.length} 个）===\n`);
+  console.log(`\n=== 逐场导出并上传（共 ${videos.length} 个）===\n`);
   const exportResults = [];
+  const uploadSummary = [];
+
   for (let i = 0; i < videos.length; i++) {
     const videoPath = videos[i];
     const meta = parseVideoFilename(videoPath);
     const live = meta?.id ? liveMetaById[meta.id] : null;
     const displayName = live?.name || meta?.name || (meta?.id ? `直播${meta.id}` : path.basename(videoPath));
-    console.log(`--- [${i + 1}/${videos.length}] ${meta?.id || path.basename(videoPath)} ---`);
-    try {
-      const result = exportAudioFromVideo(videoPath);
-      exportResults.push({ ...meta, name: displayName, ...result });
-    } catch (err) {
-      console.log(`  导出失败: ${err.message}`);
-      exportResults.push({ ...meta, name: displayName, status: 'error', error: err.message });
-    }
-  }
-
-  console.log(`\n=== 阶段 3: 上传音频到飞书 ===\n`);
-  const uploadSummary = [];
-  for (let i = 0; i < exportResults.length; i++) {
-    const item = exportResults[i];
-    if (!item.outputPath) continue;
-    console.log(`--- [${i + 1}] 上传 ${item.id} ---`);
-    try {
-      const result = await uploadAudioToFeishu({
-        date: item.date,
-        name: item.name,
-        filePath: item.outputPath,
-      });
-      uploadSummary.push({
-        id: item.id,
-        status: result.skipped ? 'skipped' : 'success',
-      });
-    } catch (err) {
-      console.log(`  上传失败: ${err.message}`);
-      uploadSummary.push({ id: item.id, status: 'error', error: err.message });
-    }
+    console.log(`\n--- [${i + 1}/${videos.length}] ---`);
+    const { exportResults: er, uploadSummary: us } = await exportAndUploadOne(
+      { ...meta, videoPath },
+      displayName
+    );
+    exportResults.push(...er);
+    uploadSummary.push(...us);
   }
 
   return { exportResults, uploadSummary, videoCount: videos.length };
@@ -138,23 +235,25 @@ async function main() {
   const targetDate = resolveTargetDate(options.date);
 
   printBanner('定时任务2：下载视频 → 导出音频 → 上传飞书', targetDate);
-  console.log('流程: 下载视频 → 关闭浏览器 → ffmpeg 导出音频 → 分片上传飞书\n');
+  console.log('流程: 连续发起下载（后台并行）→ 下完即 ffmpeg → 上传飞书（上传可重叠）\n');
 
   let downloadResults = [];
+  let exportResults = [];
+  let uploadSummary = [];
+  let videoCount = 0;
+
   if (!options.audioOnly) {
     console.log('提示: 下载过程中会保持浏览器和中控台页面打开，请勿手动关闭\n');
-    downloadResults = await downloadAllVideos(options, targetDate);
+    const pipeline = await processLivesPipeline(options, targetDate);
+    downloadResults = pipeline.downloadResults;
+    uploadSummary = pipeline.uploadSummary;
+    videoCount = pipeline.videoCount;
+  } else {
+    const result = await exportAndUploadAudio(targetDate, {});
+    exportResults = result.exportResults;
+    uploadSummary = result.uploadSummary;
+    videoCount = result.videoCount;
   }
-
-  const liveMetaById = {};
-  for (const item of downloadResults) {
-    if (item.live) liveMetaById[item.liveId] = item.live;
-  }
-
-  const { exportResults, uploadSummary, videoCount } = await exportAndUploadAudio(
-    targetDate,
-    liveMetaById
-  );
 
   console.log('\n=== 执行摘要 ===');
   if (!options.audioOnly) {
