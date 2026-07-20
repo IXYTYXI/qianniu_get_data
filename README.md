@@ -291,10 +291,14 @@ mkdir -p logs
 
 | 文件 | 作用 |
 |------|------|
+| `env.bat` | 共用环境：`PLAYWRIGHT_HEADLESS=1`、Chrome Profile 路径 |
 | `run-task-barrage.bat` | 执行任务 1，日志写入 `logs/` |
 | `run-task-audio.bat` | 执行任务 2，日志写入 `logs/` |
+| `run-backfill-audio.bat` | 补跑指定日期的音频任务 |
 | `install-scheduled-tasks.ps1` | 一键注册两个定时任务 |
 | `uninstall-scheduled-tasks.ps1` | 卸载定时任务 |
+
+Windows 定时任务会自动使用 **headless Chrome**，Profile 默认在 `%LOCALAPPDATA%\qianniu-chrome-profile`（避免 `Program Files` 无写权限）。首次升级后请把旧目录 `.chrome-profile` 复制到新路径，以免重新登录。
 
 #### 一键安装（推荐）
 
