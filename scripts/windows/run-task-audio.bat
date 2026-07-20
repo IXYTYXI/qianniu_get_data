@@ -8,6 +8,8 @@ chcp 65001 >nul
 set "ROOT=%~dp0..\.."
 cd /d "%ROOT%"
 
+call "%~dp0env.bat"
+
 rem 若未在 .env 中配置 FFMPEG_PATH，可在此取消注释并填写实际路径
 rem set "FFMPEG_PATH=D:\tools\ffmpeg\bin\ffmpeg.exe"
 
@@ -22,7 +24,7 @@ echo [%date% %time%] task-audio start>>"%LOG%"
 echo ROOT=!CD!>>"%LOG%"
 where node >>"%LOG%" 2>&1
 where npm >>"%LOG%" 2>&1
-node -e "const c=require('./config'); console.log('chrome:', c.chromePath); console.log('ffmpeg:', c.ffmpegPath);" >>"%LOG%" 2>&1
+node -e "const c=require('./config'); console.log('chrome:', c.chromePath); console.log('ffmpeg:', c.ffmpegPath); console.log('profile:', c.userDataDir); console.log('headless:', process.env.PLAYWRIGHT_HEADLESS);" >>"%LOG%" 2>&1
 
 call npm run task-audio -- --date yesterday --skip-login >>"%LOG%" 2>&1
 set "EXIT_CODE=!ERRORLEVEL!"

@@ -11,6 +11,8 @@ chcp 65001 >nul
 set "ROOT=%~dp0..\.."
 cd /d "%ROOT%"
 
+call "%~dp0env.bat"
+
 set "TARGET_DATE=%~1"
 if "%TARGET_DATE%"=="" (
   for /f "usebackq delims=" %%I in (`powershell -NoProfile -Command "(Get-Date).AddDays(-1).ToString('yyyy-MM-dd')"`) do set "TARGET_DATE=%%I"
