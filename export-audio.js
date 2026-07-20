@@ -72,6 +72,7 @@ async function main() {
       const result = await uploadAudioToFeishu({
         date: item.date,
         name: item.name,
+        liveId: item.id,
         filePath: item.outputPath,
       });
       uploadSummary.push({ id: item.id, status: result.skipped ? 'skipped' : 'success' });

@@ -69,7 +69,8 @@ async function feishuRequest(method, apiPath, options = {}) {
   const res = await fetch(url, fetchOptions);
   const data = await res.json();
   if (data.code !== 0) {
-    throw new Error(`飞书 API 错误 [${data.code}]: ${data.msg}`);
+    const detail = data.error?.log_id ? ` (log_id: ${data.error.log_id})` : '';
+    throw new Error(`飞书 API 错误 [${data.code}]: ${data.msg}${detail}`);
   }
   return data.data;
 }
@@ -213,7 +214,11 @@ async function uploadAllMedia(appToken, filePath) {
   if (data.code !== 0) {
     throw new Error(`飞书附件上传失败: ${data.msg}`);
   }
-  return data.data.file_token;
+  const fileToken = data.data?.file_token;
+  if (!fileToken) {
+    throw new Error(`上传完成但未返回 file_token: ${JSON.stringify(data.data)}`);
+  }
+  return fileToken;
 }
 
 async function uploadMultipartMedia(appToken, filePath) {
@@ -230,7 +235,11 @@ async function uploadMultipartMedia(appToken, filePath) {
     },
   });
 
-  const { upload_id: uploadId, block_size: blockSize = 4 * 1024 * 1024 } = prepare;
+  const {
+    upload_id: uploadId,
+    block_size: blockSize = 4 * 1024 * 1024,
+    block_num: blockNum,
+  } = prepare;
   let offset = 0;
   let seq = 0;
 
@@ -262,10 +271,19 @@ async function uploadMultipartMedia(appToken, filePath) {
     seq += 1;
   }
 
+  const uploadedBlocks = blockNum ?? seq;
+  if (blockNum != null && seq !== blockNum) {
+    throw new Error(`分片数量不一致: 已上传 ${seq} 片，预上传要求 ${blockNum} 片`);
+  }
+
   const finish = await feishuRequest('POST', '/open-apis/drive/v1/medias/upload_finish', {
-    body: { upload_id: uploadId },
+    body: { upload_id: uploadId, block_num: uploadedBlocks },
   });
-  return finish.file_token;
+  const fileToken = finish.file_token;
+  if (!fileToken) {
+    throw new Error(`分片上传完成但未返回 file_token: ${JSON.stringify(finish)}`);
+  }
+  return fileToken;
 }
 
 async function uploadMedia(appToken, filePath) {

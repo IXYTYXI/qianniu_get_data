@@ -251,23 +251,35 @@ async function ensureVideoTable(config) {
   return tableId;
 }
 
-async function findVideoRecord(appToken, tableId, date, name) {
-  try {
-    const items = await api.searchRecords(appToken, tableId, {
-      filter: {
-        conjunction: 'and',
-        conditions: [
-          { field_name: '名称', operator: 'is', value: [name] },
-          { field_name: '日期', operator: 'is', value: [date] },
-        ],
-      },
-      field_names: ['日期', '名称', '音频', '视频'],
-      page_size: 20,
-    });
-    return items[0] || null;
-  } catch {
-    return null;
+async function findVideoRecord(appToken, tableId, date, name, liveId) {
+  const names = liveId
+    ? [buildFeishuRecordName(liveId, name)]
+    : [name];
+
+  for (const recordName of names) {
+    try {
+      const items = await api.searchRecords(appToken, tableId, {
+        filter: {
+          conjunction: 'and',
+          conditions: [
+            { field_name: '名称', operator: 'is', value: [recordName] },
+            { field_name: '日期', operator: 'is', value: [date] },
+          ],
+        },
+        field_names: ['日期', '名称', '音频', '视频'],
+        page_size: 20,
+      });
+      if (items[0]) return items[0];
+    } catch {
+      // try next name variant
+    }
   }
+  return null;
+}
+
+function buildFeishuRecordName(liveId, name) {
+  if (liveId) return `${liveId} ${name}`.trim();
+  return name;
 }
 
 async function ensureAudioField(appToken, tableId) {
@@ -293,9 +305,10 @@ async function uploadAttachmentToRecord({
   console.log('  附件上传完成');
 }
 
-async function uploadVideoToFeishu({ date, name, filePath }) {
+async function uploadVideoToFeishu({ date, name, liveId, filePath }) {
   const config = loadFeishuConfig();
   const tableId = await ensureVideoTable(config);
+  const recordName = buildFeishuRecordName(liveId, name);
   const filename = path.basename(filePath);
   const fileSize = fs.statSync(filePath).size;
   const sizeMb = (fileSize / 1024 / 1024).toFixed(1);
@@ -305,11 +318,11 @@ async function uploadVideoToFeishu({ date, name, filePath }) {
     console.warn('  警告: 飞书附件单文件上限 2GB，超大文件可能上传失败');
   }
 
-  const existing = await findVideoRecord(config.baseToken, tableId, date, name);
+  const existing = await findVideoRecord(config.baseToken, tableId, date, name, liveId);
   if (existing) {
     const attachments = existing.fields?.['视频'] || [];
     if (Array.isArray(attachments) && attachments.length > 0) {
-      console.log(`  已存在且已有视频附件，跳过: ${name}`);
+      console.log(`  已存在且已有视频附件，跳过: ${recordName}`);
       fs.unlinkSync(filePath);
       return { skipped: true, reason: 'already_uploaded' };
     }
@@ -317,7 +330,7 @@ async function uploadVideoToFeishu({ date, name, filePath }) {
 
   let recordId = existing?.record_id;
   if (!recordId) {
-    const record = await api.createRecord(config.baseToken, tableId, { 日期: date, 名称: name });
+    const record = await api.createRecord(config.baseToken, tableId, { 日期: date, 名称: recordName });
     recordId = record?.record_id;
     if (!recordId) {
       throw new Error('创建视频记录失败');
@@ -341,23 +354,34 @@ async function uploadVideoToFeishu({ date, name, filePath }) {
   return { uploaded: true, recordId, tableId };
 }
 
-async function uploadAudioToFeishu({ date, name, filePath }) {
+function hasMatchingAttachment(attachments, filePath) {
+  if (!Array.isArray(attachments) || attachments.length === 0) return false;
+  const expectedName = path.basename(filePath);
+  return attachments.some((item) => item.name === expectedName);
+}
+
+async function uploadAudioToFeishu({ date, name, liveId, filePath }) {
   const config = loadFeishuConfig();
   const tableId = await ensureVideoTable(config);
   await ensureAudioField(config.baseToken, tableId);
+  const recordName = buildFeishuRecordName(liveId, name);
 
-  const existing = await findVideoRecord(config.baseToken, tableId, date, name);
+  const existing = await findVideoRecord(config.baseToken, tableId, date, name, liveId);
   if (existing) {
     const attachments = existing.fields?.['音频'] || [];
-    if (Array.isArray(attachments) && attachments.length > 0) {
-      console.log(`  已存在且已有音频附件，跳过: ${name}`);
+    if (hasMatchingAttachment(attachments, filePath)) {
+      console.log(`  已存在且已有音频附件，跳过: ${recordName}`);
       return { skipped: true, reason: 'already_uploaded' };
+    }
+    if (attachments.length > 0) {
+      const names = attachments.map((item) => item.name).filter(Boolean).join(', ') || '(未知文件名)';
+      console.log(`  已有音频附件但不匹配，将覆盖: ${names}`);
     }
   }
 
   let recordId = existing?.record_id;
   if (!recordId) {
-    const record = await api.createRecord(config.baseToken, tableId, { 日期: date, 名称: name });
+    const record = await api.createRecord(config.baseToken, tableId, { 日期: date, 名称: recordName });
     recordId = record?.record_id;
     if (!recordId) {
       throw new Error('创建记录失败');
