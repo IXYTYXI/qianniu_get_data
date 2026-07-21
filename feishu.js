@@ -389,6 +389,20 @@ function hasMatchingAttachment(attachments, filePath) {
   return attachments.some((item) => item.name === expectedName);
 }
 
+/** 音频上传完成或飞书已有同文件时，删除本地 mp3 及同名 mp4 */
+function cleanupLocalMediaPair(audioPath) {
+  const base = path.basename(audioPath, path.extname(audioPath));
+  const candidates = [
+    audioPath,
+    path.join(appConfig.videoDownloadDir, `${base}.mp4`),
+  ];
+  for (const filePath of candidates) {
+    if (!fs.existsSync(filePath)) continue;
+    fs.unlinkSync(filePath);
+    console.log(`  已删除本地文件: ${path.basename(filePath)}`);
+  }
+}
+
 async function uploadAudioToFeishu({ date, name, liveId, filePath }) {
   const config = loadFeishuConfig();
   const tableId = await ensureVideoTable(config);
@@ -400,6 +414,7 @@ async function uploadAudioToFeishu({ date, name, liveId, filePath }) {
     const attachments = existing.fields?.['音频'] || [];
     if (hasMatchingAttachment(attachments, filePath)) {
       console.log(`  已存在且已有音频附件，跳过: ${recordName}`);
+      cleanupLocalMediaPair(filePath);
       return { skipped: true, reason: 'already_uploaded' };
     }
     if (attachments.length > 0) {
@@ -429,6 +444,7 @@ async function uploadAudioToFeishu({ date, name, liveId, filePath }) {
     label: '音频',
   });
 
+  cleanupLocalMediaPair(filePath);
   return { uploaded: true, recordId, tableId };
 }
 
