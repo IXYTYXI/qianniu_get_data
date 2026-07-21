@@ -130,7 +130,9 @@ class QianniuDownloader {
   async _handleDownload(download, page) {
     const filename = download.suggestedFilename();
     const savePath = path.join(config.downloadDir, filename);
-    const hintText = this.pendingDownloads.get(page) || '';
+    const pending = this.pendingDownloads.get(page);
+    const hintText = typeof pending === 'string' ? pending : (pending?.rowText || '');
+    const liveId = typeof pending === 'object' ? pending?.liveId : null;
     console.log(`  [下载中] ${filename}`);
 
     try {
@@ -143,7 +145,7 @@ class QianniuDownloader {
         this.options.mode === 'barrage' ||
         this.options.mode === 'barrage-task'
       )) {
-        await importBarrageToFeishu(savePath, hintText);
+        await importBarrageToFeishu(savePath, hintText, { liveId });
       }
     } catch (e) {
       console.log(`  [下载失败] ${filename}: ${e.message}`);
@@ -545,7 +547,7 @@ class QianniuDownloader {
     }));
     console.log(`  确认导出按钮: ${btnMeta.tag}.${btnMeta.className} src=${btnMeta.src}`);
 
-    this.pendingDownloads.set(targetPage, rowText);
+    this.pendingDownloads.set(targetPage, { rowText, liveId });
     this.suppressAutoDownloadHandler = true;
     try {
       const [download] = await Promise.all([

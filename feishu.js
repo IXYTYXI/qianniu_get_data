@@ -9,6 +9,7 @@ const FEISHU_CONFIG_PATH = path.join(__dirname, 'feishu.config.json');
 const BATCH_SIZE = 200;
 const SKIP_IMPORT_COLUMNS = new Set(['引用用户ID', '引用用户名称', '引用消息']);
 const SEQ_FIELD = '序号';
+const LIVE_ID_FIELD = '直播ID';
 
 const VIDEO_TABLE_NAME = '直播视频';
 const VIDEO_TABLE_FIELDS = [
@@ -33,6 +34,13 @@ function detectSchoolLevel(text) {
   if (text.includes('【初中】') || text.includes('初中')) return '初中';
   if (text.includes('【高中】') || text.includes('高中')) return '高中';
   return null;
+}
+
+function extractLiveId(text) {
+  if (!text) return null;
+  return text.match(/(\d{6})(?=\d{4}-\d{2}-\d{2})/)?.[1]
+    || text.match(/\b(\d{6})\b/)?.[1]
+    || null;
 }
 
 async function ensureFields(appToken, tableId, headers) {
@@ -78,6 +86,24 @@ async function listRecordsForDate(appToken, tableId, date) {
     },
     field_names: ['时间', SEQ_FIELD],
   });
+}
+
+async function deleteRecordsForLiveAndDate(appToken, tableId, date, liveId) {
+  const items = await api.searchRecordsAll(appToken, tableId, {
+    filter: {
+      conjunction: 'and',
+      conditions: [
+        { field_name: '时间', operator: 'contains', value: [date] },
+        { field_name: LIVE_ID_FIELD, operator: 'is', value: [String(liveId)] },
+      ],
+    },
+    field_names: ['时间', LIVE_ID_FIELD],
+  });
+  if (!items.length) return 0;
+  const ids = items.map((item) => item.record_id).filter(Boolean);
+  await api.batchDeleteRecords(appToken, tableId, ids);
+  console.log(`  已清除 ${date} 直播 ${liveId} 旧记录 ${ids.length} 条`);
+  return ids.length;
 }
 
 async function deleteRecordsForDate(appToken, tableId, date) {
@@ -152,12 +178,13 @@ async function ensureDailySeqField(appToken, tableId, tableName) {
   }
 }
 
-function buildImportRows(headers, dataRows) {
+function buildImportRows(headers, dataRows, liveId) {
   const timeIdx = headers.indexOf('时间');
   const filteredHeaders = headers.filter(
-    (h) => h && !SKIP_IMPORT_COLUMNS.has(h) && h !== SEQ_FIELD
+    (h) => h && !SKIP_IMPORT_COLUMNS.has(h) && h !== SEQ_FIELD && h !== LIVE_ID_FIELD
   );
   const importHeaders = [...filteredHeaders];
+  if (liveId) importHeaders.push(LIVE_ID_FIELD);
 
   const dateGroups = {};
   for (const row of dataRows) {
@@ -175,9 +202,11 @@ function buildImportRows(headers, dataRows) {
         if (val == null || String(val).trim() === '') return null;
         return String(val);
       });
+      if (liveId) values.push(String(liveId));
       allRows.push(values);
     }
-    console.log(`  日期 ${date}: ${rows.length} 条（序号由公式按日自动生成）`);
+    const liveTag = liveId ? ` 直播 ${liveId}` : '';
+    console.log(`  日期 ${date}${liveTag}: ${rows.length} 条（序号由公式按日自动生成）`);
   }
 
   return { importHeaders, allRows, dates: Object.keys(dateGroups) };
@@ -403,7 +432,7 @@ async function uploadAudioToFeishu({ date, name, liveId, filePath }) {
   return { uploaded: true, recordId, tableId };
 }
 
-async function importBarrageToFeishu(filePath, hintText = '') {
+async function importBarrageToFeishu(filePath, hintText = '', options = {}) {
   const config = loadFeishuConfig();
   const filename = path.basename(filePath);
   const school = detectSchoolLevel(`${hintText} ${filename}`);
@@ -411,36 +440,44 @@ async function importBarrageToFeishu(filePath, hintText = '') {
     throw new Error(`无法识别学段: ${filename}`);
   }
 
+  const liveId = options.liveId || extractLiveId(hintText);
+
   const table = config.tables[school];
   if (!table) {
     throw new Error(`未配置学段表: ${school}`);
   }
 
-  console.log(`\n导入飞书: ${filename} → ${table.name}`);
+  console.log(`\n导入飞书: ${filename} → ${table.name}${liveId ? ` (直播 ${liveId})` : ''}`);
   const { headers, dataRows } = readXlsx(filePath);
   if (!headers.length || !dataRows.length) {
     throw new Error(`xlsx 为空: ${filename}`);
   }
 
   const writableHeaders = headers.filter((h) => h && !SKIP_IMPORT_COLUMNS.has(h));
+  if (liveId) writableHeaders.push(LIVE_ID_FIELD);
   await ensureFields(config.baseToken, table.tableId, writableHeaders);
   await ensureDailySeqField(config.baseToken, table.tableId, table.name);
 
-  const { importHeaders, allRows, dates } = buildImportRows(headers, dataRows);
+  const { importHeaders, allRows, dates } = buildImportRows(headers, dataRows, liveId);
   for (const date of dates) {
     if (date === 'unknown') continue;
-    await deleteRecordsForDate(config.baseToken, table.tableId, date);
+    if (liveId) {
+      await deleteRecordsForLiveAndDate(config.baseToken, table.tableId, date, liveId);
+    } else {
+      await deleteRecordsForDate(config.baseToken, table.tableId, date);
+    }
   }
   await batchCreateRecords(config.baseToken, table.tableId, importHeaders, allRows);
 
   fs.unlinkSync(filePath);
   console.log(`  导入完成，已删除本地文件: ${filename}`);
-  return { school, table: table.name, rows: dataRows.length };
+  return { school, table: table.name, liveId, rows: dataRows.length };
 }
 
 module.exports = {
   loadFeishuConfig,
   detectSchoolLevel,
+  extractLiveId,
   importBarrageToFeishu,
   resequenceRecordsForDate,
   ensureVideoTable,
