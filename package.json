@@ -17,7 +17,8 @@
     "import-barrage": "node import-barrage.js",
     "reseq-barrage": "node reseq-barrage.js",
     "setup-seq-formula": "node setup-seq-formula.js",
-    "verify-feishu": "node verify-feishu.js"
+    "verify-feishu": "node verify-feishu.js",
+    "backfill-week": "node backfill-week.js"
   },
   "dependencies": {
     "playwright": "^1.61.1",
