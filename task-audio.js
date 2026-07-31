@@ -25,12 +25,12 @@ const {
   triggerDownloadLive,
 } = require('./download-video');
 const {
-  exportAudioFromVideo,
+  exportAudioSegmentsFromVideo,
   listVideosForDate,
   parseVideoFilename,
   checkFfmpeg,
 } = require('./audio');
-const { uploadAudioToFeishu } = require('./feishu');
+const { uploadAudioToFeishu, checkAudioUploadedToFeishu } = require('./feishu');
 
 function parseOptions(argv) {
   const options = parseCliArgs(argv, {
@@ -44,38 +44,47 @@ function parseOptions(argv) {
   return options;
 }
 
-async function exportAndUploadOne(meta, displayName, { awaitUpload = true } = {}) {
-  const uploadSummary = [];
-  const exportResults = [];
+async function transcodeOne(meta, displayName) {
   console.log(`--- ${meta?.id || path.basename(meta?.videoPath || '')} ---`);
-  try {
-    const result = exportAudioFromVideo(meta.videoPath);
-    const item = { ...meta, name: displayName, ...result };
-    exportResults.push(item);
-    if (!item.outputPath) return { exportResults, uploadSummary };
+  const result = exportAudioSegmentsFromVideo(meta.videoPath);
+  return { ...meta, name: displayName, ...result };
+}
 
-    console.log(`  上传飞书: ${item.id}${awaitUpload ? '' : '（后台）'}`);
-    const uploadPromise = uploadAudioToFeishu({
+async function uploadOne(item) {
+  if (!item.segmentPaths?.length) {
+    return { id: item.id, status: 'skipped', reason: 'no_segments' };
+  }
+  console.log(`\n>>> 上传飞书: ${item.id}（${item.segmentPaths.length} 段）`);
+  try {
+    const upload = await uploadAudioToFeishu({
       date: item.date,
       name: item.name,
       liveId: item.id,
-      filePath: item.outputPath,
-    }).then((upload) => {
-      uploadSummary.push({
-        id: item.id,
-        status: upload.skipped ? 'skipped' : 'success',
-      });
-      return upload;
-    }).catch((err) => {
-      console.log(`  [${item.id}] 上传失败: ${err.message}`);
-      uploadSummary.push({ id: item.id, status: 'error', error: err.message });
-      throw err;
+      filePaths: item.segmentPaths,
     });
+    return {
+      id: item.id,
+      status: upload.skipped ? 'skipped' : 'success',
+    };
+  } catch (err) {
+    console.log(`  [${item.id}] 上传失败: ${err.message}`);
+    return { id: item.id, status: 'error', error: err.message };
+  }
+}
+
+async function exportAndUploadOne(meta, displayName, { awaitUpload = true } = {}) {
+  const uploadSummary = [];
+  const exportResults = [];
+  try {
+    const item = await transcodeOne(meta, displayName);
+    exportResults.push(item);
+    if (!item.segmentPaths?.length) return { exportResults, uploadSummary };
 
     if (awaitUpload) {
-      await uploadPromise;
+      const result = await uploadOne(item);
+      uploadSummary.push(result);
     }
-    return { exportResults, uploadSummary, uploadPromise: awaitUpload ? null : uploadPromise };
+    return { exportResults, uploadSummary, uploadItem: awaitUpload ? null : item };
   } catch (err) {
     console.log(`  失败: ${err.message}`);
     exportResults.push({ ...meta, name: displayName, status: 'error', error: err.message });
@@ -84,46 +93,81 @@ async function exportAndUploadOne(meta, displayName, { awaitUpload = true } = {}
   return { exportResults, uploadSummary };
 }
 
-function schedulePostDownload(live, filePath, uploadSummary, uploadTasks) {
+function schedulePostDownload(live, filePath, transcodeResults) {
   const meta = parseVideoFilename(filePath);
   const displayName = live.name || meta?.name || `直播${live.id}`;
-  return exportAndUploadOne(
-    { ...meta, videoPath: filePath },
-    displayName,
-    { awaitUpload: false }
-  ).then(({ uploadPromise }) => {
-    if (uploadPromise) {
-      uploadTasks.add(uploadPromise);
-      uploadPromise.finally(() => uploadTasks.delete(uploadPromise));
-    }
+  return transcodeOne({ ...meta, videoPath: filePath }, displayName).then((item) => {
+    transcodeResults.push(item);
   });
 }
 
-async function processLivesPipeline(options, targetDate) {
+async function runPool(items, worker, concurrency) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function runWorker() {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await worker(items[index], index);
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, items.length) }, () => runWorker())
+  );
+  return results;
+}
+
+async function runUploadQueue(transcodeResults) {
+  const pending = transcodeResults.filter((item) => item.segmentPaths?.length);
+  if (!pending.length) return [];
+
+  const min = config.feishuUploadConcurrencyMin ?? 3;
+  const concurrency = Math.max(min, config.feishuUploadConcurrency ?? min);
+  console.log(`\n=== 飞书上传队列（${pending.length} 场，并发 ${concurrency}，与浏览器无关）===`);
+  return runPool(pending, (item) => uploadOne(item), concurrency);
+}
+
+async function processLivesPipeline(options, targetDate, session = null) {
   if (!checkFfmpeg()) {
     throw new Error(`未找到 ffmpeg: ${config.ffmpegPath}`);
   }
 
-  const { context, page } = await launchBrowser();
+  const ownsBrowser = !session;
+  let context;
+  let page;
+  if (session) {
+    context = session.context;
+    page = session.page;
+  } else {
+    ({ context, page } = await launchBrowser());
+  }
+
   const downloadResults = [];
   const uploadSummary = [];
+  const transcodeResults = [];
 
   try {
-    const loggedIn = await waitForLogin(page, options);
-    if (!loggedIn) {
-      console.error('未登录且设置了 --skip-login，任务终止');
-      process.exit(1);
+    if (ownsBrowser) {
+      const loggedIn = await waitForLogin(page, options);
+      if (!loggedIn) {
+        if (!options.keepBrowser) await context.close().catch(() => {});
+        if (!options.continueOnError) process.exit(1);
+        return { downloadResults, uploadSummary, videoCount: 0, ok: false };
+      }
     }
 
     await page.goto(config.centerUrl, { timeout: config.navigationTimeout });
     await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
     await page.waitForTimeout(2000);
 
-    await filterByDate(page, targetDate);
-    const lives = await findLiveRows(page, targetDate);
+    const filterResult = await filterByDate(page, targetDate);
+    const listSearchOptions = { dateFilterApplied: filterResult.applied };
+    const lives = await findLiveRows(page, targetDate, listSearchOptions);
     if (!lives.length) {
       console.log(`未找到 ${targetDate} 的直播记录`);
-      return { downloadResults, uploadSummary, videoCount: 0 };
+      return { downloadResults, uploadSummary, videoCount: 0, ok: true };
     }
 
     await filterByDate(page, targetDate);
@@ -133,17 +177,34 @@ async function processLivesPipeline(options, targetDate) {
 
     const downloadPromises = [];
     const postProcessTasks = [];
-    const uploadTasks = new Set();
 
     for (let i = 0; i < lives.length; i++) {
       const live = lives[i];
       console.log(`\n--- [${i + 1}/${lives.length}] 发起下载 ${live.id} ---`);
 
-      const dl = await triggerDownloadLive(context, page, live, targetDate);
+      try {
+        const uploadCheck = await checkAudioUploadedToFeishu({
+          date: targetDate,
+          name: live.name,
+          liveId: live.id,
+        });
+        if (uploadCheck.complete) {
+          console.log(`  飞书音频已齐全（${uploadCheck.segmentCount} 段），跳过下载/转码: ${live.id}`);
+          downloadResults.push({ liveId: live.id, live, status: 'skipped_uploaded' });
+          continue;
+        }
+        if (uploadCheck.segmentCount > 0) {
+          console.log(`  飞书音频不完整（${uploadCheck.segmentCount} 段），需补传: ${live.id}`);
+        }
+      } catch (err) {
+        console.log(`  飞书检查失败，继续下载: ${err.message}`);
+      }
+
+      const dl = await triggerDownloadLive(context, page, live, targetDate, listSearchOptions);
 
       if (dl.status === 'downloaded' && dl.filePath) {
         downloadResults.push({ liveId: live.id, live, ...dl });
-        postProcessTasks.push(schedulePostDownload(live, dl.filePath, uploadSummary, uploadTasks));
+        postProcessTasks.push(schedulePostDownload(live, dl.filePath, transcodeResults));
         continue;
       }
 
@@ -158,7 +219,7 @@ async function processLivesPipeline(options, targetDate) {
             if (completed.status === 'downloaded' && completed.filePath) {
               console.log(`\n--- ${live.id} 下载完成，开始转音频 ---`);
               postProcessTasks.push(
-                schedulePostDownload(live, completed.filePath, uploadSummary, uploadTasks)
+                schedulePostDownload(live, completed.filePath, transcodeResults)
               );
             }
             return completed;
@@ -179,22 +240,21 @@ async function processLivesPipeline(options, targetDate) {
       console.log('\n等待转音频任务完成...');
       await Promise.all(postProcessTasks);
     }
-
-    if (uploadTasks.size) {
-      console.log(`等待 ${uploadTasks.size} 个飞书上传完成...`);
-      await Promise.all([...uploadTasks]);
-    }
   } finally {
-    if (!options.keepBrowser) {
-      console.log('\n全部处理结束，关闭浏览器...');
+    if (!options.keepBrowser && ownsBrowser) {
+      console.log('\n下载/转码完成，关闭浏览器...');
       await context.close().catch(() => {});
     }
   }
+
+  const queuedUploads = await runUploadQueue(transcodeResults);
+  uploadSummary.push(...queuedUploads);
 
   return {
     downloadResults,
     uploadSummary,
     videoCount: downloadResults.filter((d) => d.status === 'downloaded').length,
+    ok: true,
   };
 }
 
@@ -235,7 +295,7 @@ async function main() {
   const targetDate = resolveTargetDate(options.date);
 
   printBanner('定时任务2：下载视频 → 导出音频 → 上传飞书', targetDate);
-  console.log('流程: 连续发起下载（后台并行）→ 下完即 ffmpeg → 上传飞书（上传可重叠）\n');
+  console.log('流程: 连续发起下载（后台并行）→ 下完即 ffmpeg → 关闭浏览器 → 并发上传飞书\n');
 
   let downloadResults = [];
   let exportResults = [];
@@ -285,7 +345,7 @@ async function main() {
     console.error('有视频但音频均未上传成功');
     process.exit(1);
   }
-  if (!options.audioOnly && downloadResults.length > 0 && downloaded === 0 && transcoding === downloadResults.length) {
+  if (!options.allowTranscodingSkip && !options.audioOnly && downloadResults.length > 0 && downloaded === 0 && transcoding === downloadResults.length) {
     console.error('所有场次仍在转码中，请稍后重跑任务 2');
     process.exit(1);
   }
@@ -300,3 +360,9 @@ if (require.main === module) {
     process.exit(1);
   });
 }
+
+module.exports = {
+  parseOptions,
+  processLivesPipeline,
+  exportAndUploadAudio,
+};

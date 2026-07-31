@@ -12,6 +12,21 @@ function getAudioOutputPath(videoPath) {
   return path.join(config.audioDownloadDir, `${base}.mp3`);
 }
 
+function getSegmentFilePrefix(fullMp3Path) {
+  const base = path.basename(fullMp3Path, path.extname(fullMp3Path));
+  return `${base}_part`;
+}
+
+function listExistingSegments(fullMp3Path) {
+  const dir = path.dirname(fullMp3Path);
+  const prefix = getSegmentFilePrefix(fullMp3Path);
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir)
+    .filter((f) => f.startsWith(prefix) && /\.mp3$/i.test(f))
+    .sort()
+    .map((f) => path.join(dir, f));
+}
+
 function checkFfmpeg() {
   try {
     execFileSync(config.ffmpegPath, ['-version'], { stdio: 'pipe' });
@@ -58,6 +73,76 @@ function exportAudioFromVideo(videoPath, options = {}) {
   return { outputPath, skipped: false };
 }
 
+function splitAudioIntoSegments(fullMp3Path, options = {}) {
+  if (!fs.existsSync(fullMp3Path)) {
+    throw new Error(`音频不存在: ${fullMp3Path}`);
+  }
+  if (!checkFfmpeg()) {
+    throw new Error(`未找到 ffmpeg: ${config.ffmpegPath}`);
+  }
+
+  const segmentSeconds = options.segmentSeconds ?? config.audioSegmentSeconds;
+  const overwrite = options.overwrite ?? false;
+  const existing = listExistingSegments(fullMp3Path);
+
+  if (existing.length > 0 && !overwrite) {
+    console.log(`  音频分段已存在 (${existing.length} 段)，跳过切分`);
+    return existing;
+  }
+
+  if (existing.length > 0 && overwrite) {
+    for (const p of existing) {
+      fs.unlinkSync(p);
+    }
+  }
+
+  const dir = path.dirname(fullMp3Path);
+  const pattern = path.join(dir, `${getSegmentFilePrefix(fullMp3Path)}%02d.mp3`);
+  console.log(`  按 ${segmentSeconds} 秒切分: ${path.basename(fullMp3Path)}`);
+
+  execFileSync(config.ffmpegPath, [
+    '-y',
+    '-i', fullMp3Path,
+    '-f', 'segment',
+    '-segment_time', String(segmentSeconds),
+    '-segment_start_number', '1',
+    '-reset_timestamps', '1',
+    '-acodec', 'libmp3lame',
+    '-b:a', options.bitrate || '128k',
+    '-ar', '44100',
+    pattern,
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+  const segments = listExistingSegments(fullMp3Path);
+  if (!segments.length) {
+    throw new Error('切分后未生成分段文件');
+  }
+  console.log(`  切分完成: ${segments.length} 段`);
+  return segments;
+}
+
+/**
+ * 导出整段 MP3 后按配置时长切分；默认删除整段 MP3，仅保留 _partXX 文件。
+ */
+function exportAudioSegmentsFromVideo(videoPath, options = {}) {
+  const exportResult = exportAudioFromVideo(videoPath, options);
+  const segmentPaths = splitAudioIntoSegments(exportResult.outputPath, {
+    ...options,
+    overwrite: !exportResult.skipped || options.overwrite,
+  });
+
+  if (!options.keepFullMp3 && fs.existsSync(exportResult.outputPath)) {
+    fs.unlinkSync(exportResult.outputPath);
+    console.log(`  已删除整段 MP3: ${path.basename(exportResult.outputPath)}`);
+  }
+
+  return {
+    ...exportResult,
+    segmentPaths,
+    outputPath: segmentPaths[0] || exportResult.outputPath,
+  };
+}
+
 function listVideosForDate(targetDate) {
   const dir = config.videoDownloadDir;
   if (!fs.existsSync(dir)) return [];
@@ -74,6 +159,9 @@ function parseVideoFilename(filename) {
 
 module.exports = {
   exportAudioFromVideo,
+  exportAudioSegmentsFromVideo,
+  splitAudioIntoSegments,
+  listExistingSegments,
   getAudioOutputPath,
   listVideosForDate,
   parseVideoFilename,

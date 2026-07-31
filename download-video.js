@@ -36,8 +36,8 @@ function parseOptions(argv) {
   });
 }
 
-async function openControlCenter(context, page, live) {
-  const liveRow = await findRowByLiveId(page, live.id);
+async function openControlCenter(context, page, live, listSearchOptions = {}) {
+  const liveRow = await findRowByLiveId(page, live.id, listSearchOptions);
   if (!liveRow) {
     console.log(`未找到直播行: ${live.id}`);
     return null;
@@ -240,8 +240,8 @@ async function downloadTranscodedVideo(targetPage, live) {
   return result;
 }
 
-async function triggerDownloadLive(context, page, live, targetDate) {
-  const targetPage = await openControlCenter(context, page, live);
+async function triggerDownloadLive(context, page, live, targetDate, listSearchOptions = {}) {
+  const targetPage = await openControlCenter(context, page, live, listSearchOptions);
   if (!targetPage) return { liveId: live.id, status: 'no_control', live };
 
   const openedNewTab = targetPage !== page;
@@ -342,8 +342,9 @@ async function main() {
     await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
     await page.waitForTimeout(2000);
 
-    await filterByDate(page, targetDate);
-    const lives = await findLiveRows(page, targetDate);
+    const filterResult = await filterByDate(page, targetDate);
+    const listSearchOptions = { dateFilterApplied: filterResult.applied };
+    const lives = await findLiveRows(page, targetDate, listSearchOptions);
 
     if (!lives.length) {
       console.log(`未找到 ${targetDate} 的直播记录`);
@@ -358,7 +359,7 @@ async function main() {
     const pendingDownloads = [];
     for (let i = 0; i < lives.length; i++) {
       console.log(`\n--- [${i + 1}/${lives.length}] 直播 ${lives[i].id} ---`);
-      const result = await triggerDownloadLive(context, page, lives[i], targetDate);
+      const result = await triggerDownloadLive(context, page, lives[i], targetDate, listSearchOptions);
       if (result.promise) {
         pendingDownloads.push(
           result.promise.then((completed) => ({ liveId: lives[i].id, live: lives[i], ...completed }))

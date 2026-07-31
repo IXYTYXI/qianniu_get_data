@@ -9,7 +9,7 @@
 const path = require('path');
 const { resolveTargetDate, parseCliArgs } = require('./dates');
 const {
-  exportAudioFromVideo,
+  exportAudioSegmentsFromVideo,
   listVideosForDate,
   parseVideoFilename,
   checkFfmpeg,
@@ -48,7 +48,7 @@ async function main() {
     const meta = parseVideoFilename(videoPath);
     console.log(`--- [${i + 1}/${videos.length}] ${meta?.id || path.basename(videoPath)} ---`);
     try {
-      const result = exportAudioFromVideo(videoPath);
+      const result = exportAudioSegmentsFromVideo(videoPath);
       exportResults.push({ ...meta, videoPath, ...result });
     } catch (err) {
       console.log(`  导出失败: ${err.message}`);
@@ -66,14 +66,14 @@ async function main() {
   const uploadSummary = [];
   for (let i = 0; i < exportResults.length; i++) {
     const item = exportResults[i];
-    if (!item.outputPath) continue;
-    console.log(`--- [${i + 1}] 上传 ${item.id} ---`);
+    if (!item.segmentPaths?.length) continue;
+    console.log(`--- [${i + 1}] 上传 ${item.id}（${item.segmentPaths.length} 段）---`);
     try {
       const result = await uploadAudioToFeishu({
         date: item.date,
         name: item.name,
         liveId: item.id,
-        filePath: item.outputPath,
+        filePaths: item.segmentPaths,
       });
       uploadSummary.push({ id: item.id, status: result.skipped ? 'skipped' : 'success' });
     } catch (err) {
