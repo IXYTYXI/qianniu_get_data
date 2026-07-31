@@ -3,7 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const { execSync } = require('child_process');
 const config = require('./config');
-const { getTodayUTC8 } = require('./dates');
+const { getTodayUTC8, buildCenterFilterRange } = require('./dates');
 
 function ensureChromeProfileFree(profileDir = config.userDataDir) {
   const profile = profileDir;
@@ -74,6 +74,145 @@ async function launchBrowser() {
   return { context, page };
 }
 
+async function dismissBlockingOverlays(page, stage = '') {
+  const suffix = stage ? `(${stage})` : '';
+  const dismissTexts = ['知道了', '我知道了', '下次再说', '不再提示', '不再提醒', '关闭', '跳过'];
+
+  for (let round = 0; round < 5; round++) {
+    let acted = false;
+
+    for (const text of dismissTexts) {
+      const btn = page.locator(
+        `button:visible:has-text("${text}"), .el-message-box__btns button:has-text("${text}")`
+      ).first();
+      if (await btn.isVisible({ timeout: 200 }).catch(() => false)) {
+        console.log(`  关闭通知${suffix}: ${text}`);
+        await btn.click({ timeout: 3000 }).catch(() => {});
+        await page.waitForTimeout(500);
+        acted = true;
+        break;
+      }
+    }
+
+    const closeIcon = page.locator('.el-notification__closeBtn, .ant-modal-close, .ant-notification-notice-close').first();
+    if (!acted && await closeIcon.isVisible({ timeout: 200 }).catch(() => false)) {
+      console.log(`  关闭通知${suffix}: 关闭图标`);
+      await closeIcon.click({ timeout: 3000 }).catch(() => {});
+      await page.waitForTimeout(500);
+      acted = true;
+    }
+
+    const remindDialog = page.locator('.el-dialog__wrapper.dialog-remind, .dialog-remind').first();
+    if (await remindDialog.isVisible({ timeout: 500 }).catch(() => false)) {
+      const knowBtn = remindDialog.locator(
+        'button:has-text("知道了"), button:has-text("我知道了"), .el-dialog__footer button'
+      ).first();
+      if (await knowBtn.isVisible({ timeout: 500 }).catch(() => false)) {
+        console.log(`  关闭通知${suffix}: dialog-remind`);
+        await knowBtn.click({ timeout: 3000 }).catch(() => {});
+        await page.waitForTimeout(800);
+        acted = true;
+      } else {
+        const closeBtn = remindDialog.locator('.el-dialog__headerbtn').first();
+        if (await closeBtn.isVisible({ timeout: 500 }).catch(() => false)) {
+          console.log(`  关闭弹窗${suffix}: dialog-remind`);
+          await closeBtn.click({ timeout: 3000 }).catch(() => {});
+          await page.waitForTimeout(800);
+          acted = true;
+        }
+      }
+    }
+
+    const dialogSelectors = [
+      '.el-dialog__wrapper',
+      '.el-overlay-dialog',
+      '[role="dialog"]',
+    ];
+
+    for (const selector of dialogSelectors) {
+      const dialogs = page.locator(selector);
+      const count = await dialogs.count().catch(() => 0);
+      for (let i = 0; i < count; i++) {
+        const dialog = dialogs.nth(i);
+        if (!(await dialog.isVisible({ timeout: 300 }).catch(() => false))) continue;
+
+        const title = ((await dialog.textContent().catch(() => '')) || '').replace(/\s+/g, ' ').trim();
+        if (/下载视频/.test(title)) continue;
+
+        const titleText = title.slice(0, 40) || '未知弹窗';
+        const closeBtn = dialog.locator(
+          '.el-dialog__headerbtn, .el-icon-close, button[aria-label="Close"]'
+        ).first();
+        if (await closeBtn.isVisible({ timeout: 500 }).catch(() => false)) {
+          console.log(`  关闭弹窗${suffix}: ${titleText}`);
+          await closeBtn.click();
+          await page.waitForTimeout(800);
+          acted = true;
+        }
+      }
+    }
+
+    const warmupDialog = page.locator('.el-dialog__wrapper.robot-send, .el-dialog__wrapper')
+      .filter({ hasText: '系统暖场评论' }).first();
+    if (await warmupDialog.isVisible({ timeout: 500 }).catch(() => false)) {
+      const closeBtn = warmupDialog.locator('.el-dialog__headerbtn').first();
+      if (await closeBtn.isVisible({ timeout: 500 }).catch(() => false)) {
+        console.log(`  关闭弹窗${suffix}: 系统暖场评论`);
+        await closeBtn.click();
+        await page.waitForTimeout(800);
+        acted = true;
+      }
+    }
+
+    if (!acted) break;
+  }
+}
+
+async function attemptLoginPageActions(page) {
+  const url = page.url();
+  if (!url.includes('login') && !url.includes('qiniulogin')) return false;
+
+  await dismissBlockingOverlays(page, '登录页');
+
+  const phone = process.env.QIANNIU_PHONE || process.env.QIANNIU_USERNAME;
+  const password = process.env.QIANNIU_PASSWORD;
+  if (phone) {
+    const phoneInput = page.locator(
+      'input[type="tel"], input[placeholder*="手机"], input[placeholder*="账号"], input[name*="phone"], input[name*="mobile"]'
+    ).first();
+    if (await phoneInput.isVisible({ timeout: 1500 }).catch(() => false)) {
+      await phoneInput.fill(phone);
+    }
+  }
+  if (password) {
+    const pwdInput = page.locator('input[type="password"]').first();
+    if (await pwdInput.isVisible({ timeout: 1500 }).catch(() => false)) {
+      await pwdInput.fill(password);
+    }
+  }
+
+  const loginBtn = page.locator(
+    'button:visible:has-text("登录"), ' +
+    'button:visible:has-text("立即登录"), ' +
+    'a:visible:has-text("登录"), ' +
+    'button.login-btn:visible, ' +
+    'input[type="submit"]:visible'
+  ).first();
+
+  if (await loginBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+    console.log('  自动点击「登录」按钮...');
+    await loginBtn.click();
+    await page.waitForTimeout(2000);
+    return true;
+  }
+  return false;
+}
+
+function isLoggedInUrl(url) {
+  const s = url.toString();
+  return !s.includes('qiniulogin') && !s.includes('login');
+}
+
 async function waitForLogin(page, options = {}) {
   const skipLogin = options.skipLogin;
   const waitMinutes = options.waitMinutes || config.loginWaitMinutes;
@@ -81,9 +220,9 @@ async function waitForLogin(page, options = {}) {
   console.log('尝试直接访问直播中心...');
   await page.goto(config.centerUrl, { timeout: config.navigationTimeout });
   await page.waitForTimeout(3000);
+  await dismissBlockingOverlays(page, '直播中心');
 
-  const url = page.url();
-  if (!url.includes('login') && !url.includes('qiniulogin')) {
+  if (isLoggedInUrl(page.url())) {
     console.log('已登录（会话有效）');
     return true;
   }
@@ -95,36 +234,50 @@ async function waitForLogin(page, options = {}) {
 
   console.log(`打开登录页: ${config.loginUrl}`);
   await page.goto(config.loginUrl, { timeout: config.navigationTimeout });
-  console.log(`请在浏览器中登录，等待 ${waitMinutes} 分钟...`);
-
-  try {
-    await page.waitForURL(
-      (u) => !u.toString().includes('qiniulogin') && !u.toString().includes('login'),
-      { timeout: waitMinutes * 60 * 1000 }
-    );
-    console.log('检测到登录成功');
-    return true;
-  } catch {
-    return !page.url().includes('login');
+  await page.waitForTimeout(1500);
+  if (typeof options.onLoginPage === 'function') {
+    await options.onLoginPage(page);
   }
+
+  console.log(`等待登录完成（最多 ${waitMinutes} 分钟，将自动点击登录并关闭通知）...`);
+
+  const deadline = Date.now() + waitMinutes * 60 * 1000;
+  while (Date.now() < deadline) {
+    if (isLoggedInUrl(page.url())) {
+      console.log('检测到登录成功');
+      await dismissBlockingOverlays(page, '登录后');
+      return true;
+    }
+    await attemptLoginPageActions(page);
+    await dismissBlockingOverlays(page, '登录等待');
+    await page.waitForTimeout(3000);
+  }
+
+  const ok = isLoggedInUrl(page.url());
+  if (ok) console.log('检测到登录成功');
+  return ok;
 }
 
 async function filterByDate(page, targetDate) {
-  console.log(`按日期筛选: ${targetDate}`);
+  const { start, end } = buildCenterFilterRange(targetDate);
+  console.log(`按日期筛选: ${targetDate}（${start} ~ ${end}）`);
+  await dismissBlockingOverlays(page, '筛选前');
+  await page.waitForTimeout(500);
+  await dismissBlockingOverlays(page, '筛选前');
   const startInput = page.locator('input[placeholder*="开始日期"], input[placeholder*="开始时间"]').first();
   const endInput = page.locator('input[placeholder*="结束日期"], input[placeholder*="结束时间"]').first();
 
   if (!(await startInput.isVisible({ timeout: 5000 }).catch(() => false))) {
     console.log('未找到日期筛选器');
-    return;
+    return { applied: false };
   }
 
   await startInput.click();
   await startInput.fill('');
-  await startInput.fill(targetDate);
+  await startInput.fill(start);
   await endInput.click();
   await endInput.fill('');
-  await endInput.fill(targetDate);
+  await endInput.fill(end);
   await endInput.press('Enter');
 
   const searchBtn = page.locator(
@@ -134,6 +287,7 @@ async function filterByDate(page, targetDate) {
     await searchBtn.click();
   }
   await page.waitForTimeout(4000);
+  return { applied: true };
 }
 
 function getTableRows(page) {
@@ -214,7 +368,8 @@ async function currentPageHasTargetDate(page, targetDate) {
   return false;
 }
 
-async function findLiveRows(page, targetDate) {
+async function findLiveRows(page, targetDate, options = {}) {
+  const dateFilterApplied = options.dateFilterApplied === true;
   const seen = new Set();
   const lives = [];
 
@@ -222,20 +377,42 @@ async function findLiveRows(page, targetDate) {
   await collectLiveRowsFromCurrentPage(page, targetDate, seen, lives);
   console.log(`  列表第 1 页: 累计匹配 ${lives.length} 场 (${targetDate})`);
 
-  // 定时任务（日期筛选后）：第一页通常已包含全部目标场次
+  if (dateFilterApplied) {
+    if (lives.length === 0) {
+      console.log(`  已按日期筛选，当前列表无 ${targetDate} 的直播，不翻页`);
+    } else {
+      console.log('  已按日期筛选，仅扫描筛选结果（不翻页）');
+    }
+    if (lives.length > 0) {
+      console.log(`共找到 ${lives.length} 场: ${lives.map((l) => l.id).join(', ')}`);
+    }
+    return lives;
+  }
+
   if (lives.length > 0) {
     console.log('  第 1 页已找到，跳过翻页');
     console.log(`共找到 ${lives.length} 场: ${lives.map((l) => l.id).join(', ')}`);
     return lives;
   }
 
-  // 补跑历史日期：第一页无匹配时再翻页
-  console.log('  第 1 页无匹配，开始翻页查找（补跑）');
-  for (let pageNum = 2; pageNum <= 50; pageNum += 1) {
+  const maxPages = options.maxPages ?? 15;
+  console.log(`  未使用日期筛选且第 1 页无匹配，最多再翻 ${maxPages - 1} 页`);
+  let pagesWithoutDate = 0;
+  for (let pageNum = 2; pageNum <= maxPages; pageNum += 1) {
     const hasNext = await clickNextPage(page);
     if (!hasNext) break;
 
     const hasDateOnPage = await currentPageHasTargetDate(page, targetDate);
+    if (!hasDateOnPage) {
+      pagesWithoutDate += 1;
+      if (pagesWithoutDate >= 2) {
+        console.log('  连续多页无目标日期，停止翻页');
+        break;
+      }
+    } else {
+      pagesWithoutDate = 0;
+    }
+
     await collectLiveRowsFromCurrentPage(page, targetDate, seen, lives);
     console.log(`  列表第 ${pageNum} 页: 累计匹配 ${lives.length} 场 (${targetDate})`);
 
@@ -272,14 +449,18 @@ async function findRowByLiveIdOnCurrentPage(page, liveId) {
   return fallback;
 }
 
-async function findRowByLiveId(page, liveId) {
+async function findRowByLiveId(page, liveId, options = {}) {
+  const dateFilterApplied = options.dateFilterApplied === true;
+  const maxPages = dateFilterApplied ? 1 : (options.maxPages ?? 5);
+
   await goToFirstPage(page);
 
   let row = await findRowByLiveIdOnCurrentPage(page, liveId);
   if (row) return row;
 
-  // 补跑时目标可能在后续页
-  for (let pageNum = 2; pageNum <= 50; pageNum += 1) {
+  if (maxPages <= 1) return null;
+
+  for (let pageNum = 2; pageNum <= maxPages; pageNum += 1) {
     const hasNext = await clickNextPage(page);
     if (!hasNext) break;
     row = await findRowByLiveIdOnCurrentPage(page, liveId);
@@ -299,6 +480,8 @@ function printBanner(title, targetDate) {
 module.exports = {
   launchBrowser,
   waitForLogin,
+  dismissBlockingOverlays,
+  attemptLoginPageActions,
   filterByDate,
   findLiveRows,
   findRowByLiveId,

@@ -3,7 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const config = require('./config');
 const { importBarrageToFeishu } = require('./feishu');
-const { findRowByLiveId } = require('./browser');
+const { findRowByLiveId, waitForLogin: waitForBrowserLogin, dismissBlockingOverlays, findLiveRows, filterByDate: browserFilterByDate } = require('./browser');
 
 // ========== UTC+8 Timezone Helpers ==========
 
@@ -59,6 +59,14 @@ class QianniuDownloader {
     this.pendingDownloads = new Map();
     this.downloadTasks = new Set();
     this.suppressAutoDownloadHandler = false;
+    this.listSearchOptions = { dateFilterApplied: false };
+    this.ownsContext = true;
+
+    if (options.context && options.page) {
+      this.context = options.context;
+      this.page = options.page;
+      this.ownsContext = false;
+    }
 
     if (options.date === 'yesterday') {
       this.targetDate = getYesterdayUTC8();
@@ -98,6 +106,8 @@ class QianniuDownloader {
   }
 
   attachDownloadHandler(context) {
+    if (context._qianniuDownloadBound) return;
+    context._qianniuDownloadBound = true;
     context.on('page', (page) => this.bindPageDownload(page));
     for (const page of context.pages()) {
       this.bindPageDownload(page);
@@ -129,11 +139,14 @@ class QianniuDownloader {
 
   async _handleDownload(download, page) {
     const filename = download.suggestedFilename();
-    const savePath = path.join(config.downloadDir, filename);
     const pending = this.pendingDownloads.get(page);
     const hintText = typeof pending === 'string' ? pending : (pending?.rowText || '');
     const liveId = typeof pending === 'object' ? pending?.liveId : null;
-    console.log(`  [下载中] ${filename}`);
+    const uniqueFilename = liveId
+      ? `${liveId}_${filename}`
+      : filename;
+    const savePath = path.join(config.downloadDir, uniqueFilename);
+    console.log(`  [下载中] ${uniqueFilename}`);
 
     try {
       await download.saveAs(savePath);
@@ -155,49 +168,12 @@ class QianniuDownloader {
   }
 
   async waitForLogin() {
-    // Try center URL directly first — session may still be valid
-    console.log('尝试直接访问直播中心...');
-    await this.page.goto(config.centerUrl, { timeout: config.navigationTimeout });
-    await this.page.waitForTimeout(3000);
-
-    const afterDirectUrl = this.page.url();
-    if (!afterDirectUrl.includes('login') && !afterDirectUrl.includes('qiniulogin')) {
-      console.log('已登录（会话有效），跳过登录步骤');
-      await this.screenshot('02-already-logged-in');
-      return true;
-    }
-
-    if (this.options.skipLogin) {
-      console.log('--skip-login 已设置但未登录，退出');
-      return false;
-    }
-
-    // Navigate to login page
-    console.log(`打开登录页: ${config.loginUrl}`);
-    await this.page.goto(config.loginUrl, { timeout: config.navigationTimeout });
-    await this.screenshot('01-login-page');
-
-    const waitMs = this.options.waitMinutes * 60 * 1000;
-    console.log(`\n请在浏览器中登录，等待 ${this.options.waitMinutes} 分钟...\n`);
-
-    try {
-      await this.page.waitForURL(
-        url => !url.toString().includes('qiniulogin') && !url.toString().includes('login'),
-        { timeout: waitMs }
-      );
-      console.log('检测到登录成功！');
-    } catch {
-      console.log('登录等待超时，检查当前页面...');
-      const currentUrl = this.page.url();
-      if (currentUrl.includes('login')) {
-        console.log('仍在登录页面，请手动完成登录后重新运行。');
-        return false;
-      }
-    }
-
-    await this.page.waitForTimeout(2000);
-    await this.screenshot('02-after-login');
-    return true;
+    return waitForBrowserLogin(this.page, {
+      ...this.options,
+      onLoginPage: async () => {
+        await this.screenshot('01-login-page');
+      },
+    });
   }
 
   async navigateToCenter() {
@@ -211,49 +187,18 @@ class QianniuDownloader {
 
     await this.page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
     await this.page.waitForTimeout(2000);
+    await dismissBlockingOverlays(this.page, '直播中心');
     await this.screenshot('03-center');
   }
 
   async filterByDate() {
     console.log(`\n按日期筛选: ${this.targetDate}`);
-
-    // The screenshot shows date range inputs: 开始日期 至 结束日期
-    const startInput = this.page.locator(
-      'input[placeholder*="开始日期"], input[placeholder*="开始时间"], input[placeholder*="Start"]'
-    ).first();
-    const endInput = this.page.locator(
-      'input[placeholder*="结束日期"], input[placeholder*="结束时间"], input[placeholder*="End"]'
-    ).first();
-
-    const hasDateFilter = await startInput.isVisible({ timeout: 5000 }).catch(() => false);
-
-    if (hasDateFilter) {
-      console.log('找到日期筛选器，填入日期...');
-
-      await startInput.click();
-      await this.page.waitForTimeout(500);
-      await startInput.fill(this.targetDate);
-      await this.page.waitForTimeout(500);
-
-      await endInput.click();
-      await this.page.waitForTimeout(500);
-      await endInput.fill(this.targetDate);
-      await endInput.press('Enter');
-      await this.page.waitForTimeout(1000);
-
-      // Click search button if visible
-      const searchBtn = this.page.locator(
-        'button:has-text("搜索"), button:has-text("查询"), span:has-text("搜索")'
-      ).first();
-      if (await searchBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
-        await searchBtn.click();
-      }
-
-      await this.page.waitForTimeout(3000);
-    } else {
+    const result = await browserFilterByDate(this.page, this.targetDate);
+    this.listSearchOptions = { dateFilterApplied: result.applied };
+    if (!result.applied) {
       console.log('未找到日期筛选器，将直接扫描表格行');
     }
-
+    await dismissBlockingOverlays(this.page, '筛选后');
     await this.screenshot('04-filtered');
   }
 
@@ -312,7 +257,7 @@ class QianniuDownloader {
   async processRow(liveId, rowText = '', seqIndex = 0) {
     console.log(`\n--- 处理直播 ${liveId} (${seqIndex + 1}) ---`);
 
-    const row = await findRowByLiveId(this.page, liveId);
+    const row = await findRowByLiveId(this.page, liveId, this.listSearchOptions);
     if (!row) {
       console.log(`未找到直播行: ${liveId}`);
       return;
@@ -465,45 +410,7 @@ class QianniuDownloader {
   }
 
   async closeBlockingDialogs(targetPage, stage = '') {
-    const dialogSelectors = [
-      '.el-dialog__wrapper',
-      '.el-overlay-dialog',
-      '[role="dialog"]',
-    ];
-
-    for (let round = 0; round < 5; round++) {
-      let closed = false;
-      for (const selector of dialogSelectors) {
-        const dialogs = targetPage.locator(selector);
-        const count = await dialogs.count().catch(() => 0);
-        for (let i = 0; i < count; i++) {
-          const dialog = dialogs.nth(i);
-          if (!(await dialog.isVisible({ timeout: 300 }).catch(() => false))) continue;
-
-          const title = ((await dialog.textContent().catch(() => '')) || '').replace(/\s+/g, ' ').trim();
-          const titleText = title.slice(0, 40) || '未知弹窗';
-          const closeBtn = dialog.locator('.el-dialog__headerbtn, .el-icon-close, button[aria-label="Close"]').first();
-          if (await closeBtn.isVisible({ timeout: 500 }).catch(() => false)) {
-            console.log(`  关闭弹窗${stage ? `(${stage})` : ''}: ${titleText}`);
-            await closeBtn.click();
-            await targetPage.waitForTimeout(800);
-            closed = true;
-          }
-        }
-      }
-      if (!closed) break;
-    }
-
-    const warmupDialog = targetPage.locator('.el-dialog__wrapper.robot-send, .el-dialog__wrapper')
-      .filter({ hasText: '系统暖场评论' }).first();
-    if (await warmupDialog.isVisible({ timeout: 500 }).catch(() => false)) {
-      const closeBtn = warmupDialog.locator('.el-dialog__headerbtn').first();
-      if (await closeBtn.isVisible({ timeout: 500 }).catch(() => false)) {
-        console.log(`  关闭弹窗${stage ? `(${stage})` : ''}: 系统暖场评论`);
-        await closeBtn.click();
-        await targetPage.waitForTimeout(800);
-      }
-    }
+    await dismissBlockingOverlays(targetPage, stage);
   }
 
   async exportBarrage(targetPage, liveId, rowText = '') {
@@ -657,61 +564,73 @@ class QianniuDownloader {
     } catch {}
   }
 
-  async run() {
-    try {
-      await this.launch();
+  async ensureBrowser() {
+    if (this.page && this.context) {
+      this.attachDownloadHandler(this.context);
+      return;
+    }
+    await this.launch();
+  }
 
+  async runCore({ manageSession = true } = {}) {
+    const shouldClose = manageSession && this.ownsContext;
+
+    if (manageSession && this.ownsContext) {
+      await this.ensureBrowser();
       const loggedIn = await this.waitForLogin();
       if (!loggedIn) {
+        return { ok: false, reason: 'not_logged_in' };
+      }
+    }
+
+    await this.navigateToCenter();
+    await this.filterByDate();
+
+    const lives = await findLiveRows(this.page, this.targetDate, this.listSearchOptions);
+    const uniqueLives = lives.map((live) => ({ id: live.id, rowText: live.rowText || '' }));
+
+    if (uniqueLives.length === 0) {
+      console.log(`未找到 ${this.targetDate} 的直播记录`);
+    } else {
+      console.log(`去重后处理 ${uniqueLives.length} 场直播`);
+      for (let i = 0; i < uniqueLives.length; i++) {
+        await this.processRow(uniqueLives[i].id, uniqueLives[i].rowText, i);
+      }
+    }
+
+    if (this.options.mode !== 'barrage-task') {
+      await this.tryRecordingSection();
+    }
+
+    console.log('\n=== 下载流程完成 ===');
+    if (this.downloadedFiles.length > 0) {
+      console.log(`共下载 ${this.downloadedFiles.length} 个文件:`);
+      this.downloadedFiles.forEach((f) => console.log(`  ${f}`));
+    } else {
+      console.log('未自动下载到文件，请查看截图确认页面状态');
+      console.log(`截图目录: ${config.screenshotDir}`);
+    }
+
+    console.log('等待所有下载完成...');
+    await this.waitForAllDownloads();
+    await this.page.waitForTimeout(1000);
+
+    if (shouldClose) {
+      await this.screenshot('99-final');
+      await this.close();
+    }
+
+    return { ok: true, liveCount: uniqueLives.length, downloaded: this.downloadedFiles.length };
+  }
+
+  async run() {
+    try {
+      const result = await this.runCore({ manageSession: true });
+      if (!result.ok) {
         console.error('未登录且设置了 --skip-login，任务终止');
         await this.close();
         process.exit(1);
       }
-
-      await this.navigateToCenter();
-      await this.filterByDate();
-
-      const { allRows, matches } = await this.findMatchingRows();
-      const uniqueLives = [];
-      const seenIds = new Set();
-      for (const rowIndex of matches) {
-        const text = await allRows.nth(rowIndex).textContent().catch(() => '');
-        const id = text.match(/(\d{6})(?=\d{4}-\d{2}-\d{2})/)?.[1] || text.match(/(\d{6})/)?.[1];
-        if (!id || seenIds.has(id)) continue;
-        seenIds.add(id);
-        uniqueLives.push({ id, rowText: text });
-      }
-
-      if (uniqueLives.length === 0) {
-        console.log(`未找到 ${this.targetDate} 的直播记录`);
-      } else {
-        console.log(`去重后处理 ${uniqueLives.length} 场直播`);
-        for (let i = 0; i < uniqueLives.length; i++) {
-          await this.processRow(uniqueLives[i].id, uniqueLives[i].rowText, i);
-        }
-      }
-
-      // barrage-task 只处理直播中心列表，不再额外跳转录播区域
-      if (this.options.mode !== 'barrage-task') {
-        await this.tryRecordingSection();
-      }
-
-      console.log('\n=== 下载流程完成 ===');
-      if (this.downloadedFiles.length > 0) {
-        console.log(`共下载 ${this.downloadedFiles.length} 个文件:`);
-        this.downloadedFiles.forEach(f => console.log(`  ${f}`));
-      } else {
-        console.log('未自动下载到文件，请查看截图确认页面状态');
-        console.log(`截图目录: ${config.screenshotDir}`);
-      }
-
-      // 等待所有下载任务完成后再关闭浏览器
-      console.log('等待所有下载完成...');
-      await this.waitForAllDownloads();
-      await this.page.waitForTimeout(3000);
-
-      await this.screenshot('99-final');
-      await this.close();
       console.log('EXIT_CODE: 0');
       process.exit(0);
     } catch (error) {
@@ -722,21 +641,29 @@ class QianniuDownloader {
   }
 
   async close() {
-    if (this.context) await this.context.close();
+    if (this.ownsContext && this.context) {
+      await this.context.close();
+      this.context = null;
+      this.page = null;
+    }
   }
 }
 
-const options = parseArgs();
-const downloader = new QianniuDownloader(options);
+module.exports = { QianniuDownloader, parseArgs, getYesterdayUTC8, getTodayUTC8 };
 
-process.on('SIGINT', async () => {
-  console.log('\n关闭浏览器...');
-  await downloader.close();
-  process.exit(0);
-});
+if (require.main === module) {
+  const options = parseArgs();
+  const downloader = new QianniuDownloader(options);
 
-downloader.run().catch(async (err) => {
-  console.error('致命错误:', err);
-  await downloader.close();
-  process.exit(1);
-});
+  process.on('SIGINT', async () => {
+    console.log('\n关闭浏览器...');
+    await downloader.close();
+    process.exit(0);
+  });
+
+  downloader.run().catch(async (err) => {
+    console.error('致命错误:', err);
+    await downloader.close();
+    process.exit(1);
+  });
+}
