@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const appConfig = require('./config');
 const { loadDotEnv } = require('./env');
 
 const FEISHU_HOST = 'https://open.feishu.cn';
@@ -12,6 +13,63 @@ const FIELD_TYPE = {
 
 let cachedToken = null;
 let tokenExpireAt = 0;
+
+/** 限制飞书媒体上传并发，避免多场并行占满连接导致代理断连 */
+let uploadSlots = 0;
+const uploadWaiters = [];
+
+async function acquireUploadSlot() {
+  const min = appConfig.feishuUploadConcurrencyMin ?? 3;
+  const max = Math.max(min, appConfig.feishuUploadConcurrency ?? min);
+  if (uploadSlots < max) {
+    uploadSlots += 1;
+    return;
+  }
+  await new Promise((resolve) => uploadWaiters.push(resolve));
+  uploadSlots += 1;
+}
+
+function releaseUploadSlot() {
+  uploadSlots = Math.max(0, uploadSlots - 1);
+  const next = uploadWaiters.shift();
+  if (next) next();
+}
+
+async function withUploadSlot(fn) {
+  await acquireUploadSlot();
+  try {
+    return await fn();
+  } finally {
+    releaseUploadSlot();
+  }
+}
+
+async function fetchWithRetry(url, options = {}, retryOptions = {}) {
+  const maxAttempts = retryOptions.retries ?? appConfig.feishuUploadRetries ?? 5;
+  const timeoutMs = retryOptions.timeoutMs ?? appConfig.feishuUploadTimeoutMs ?? 600_000;
+  let lastErr;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const res = await fetch(url, {
+        ...options,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      }
+      return res;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxAttempts) {
+        const delayMs = Math.min(attempt * 8000, 40_000);
+        console.log(`  网络请求失败 (${attempt}/${maxAttempts}): ${err.message}，${delayMs / 1000}s 后重试...`);
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+  }
+  throw lastErr;
+}
 
 function getAppCredentials() {
   loadDotEnv();
@@ -66,13 +124,30 @@ async function feishuRequest(method, apiPath, options = {}) {
     fetchOptions.body = JSON.stringify(options.body);
   }
 
-  const res = await fetch(url, fetchOptions);
-  const data = await res.json();
-  if (data.code !== 0) {
-    const detail = data.error?.log_id ? ` (log_id: ${data.error.log_id})` : '';
-    throw new Error(`飞书 API 错误 [${data.code}]: ${data.msg}${detail}`);
+  const maxAttempts = options.retries ?? 3;
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const res = await fetchWithRetry(url, fetchOptions, {
+        retries: 1,
+        timeoutMs: options.timeoutMs || 120_000,
+      });
+      const data = await res.json();
+      if (data.code !== 0) {
+        const detail = data.error?.log_id ? ` (log_id: ${data.error.log_id})` : '';
+        throw new Error(`飞书 API 错误 [${data.code}]: ${data.msg}${detail}`);
+      }
+      return data.data;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxAttempts) {
+        const delayMs = attempt * 5000;
+        console.log(`  飞书请求失败 (${attempt}/${maxAttempts}): ${err.message}，${delayMs / 1000}s 后重试...`);
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
   }
-  return data.data;
+  throw lastErr;
 }
 
 function appPath(appToken, suffix) {
@@ -147,6 +222,21 @@ async function searchRecords(appToken, tableId, payload) {
   return data.items || [];
 }
 
+async function listRecordsAll(appToken, tableId, { pageSize = 500, onPage } = {}) {
+  const items = [];
+  let pageToken;
+  let pageNum = 0;
+  do {
+    pageNum += 1;
+    const data = await listRecords(appToken, tableId, { pageSize, pageToken });
+    const batch = data.items || [];
+    items.push(...batch);
+    if (onPage) onPage(pageNum, items.length, data.total);
+    pageToken = data.has_more ? data.page_token : undefined;
+  } while (pageToken);
+  return items;
+}
+
 async function searchRecordsAll(appToken, tableId, payload) {
   const items = [];
   let pageToken;
@@ -194,96 +284,100 @@ async function deleteField(appToken, tableId, fieldId) {
 }
 
 async function uploadAllMedia(appToken, filePath) {
-  const buffer = fs.readFileSync(filePath);
-  const fileName = path.basename(filePath);
-  const size = buffer.length;
-  const form = new FormData();
-  form.append('file_name', fileName);
-  form.append('parent_type', 'bitable_file');
-  form.append('parent_node', appToken);
-  form.append('size', String(size));
-  form.append('file', new Blob([buffer]), fileName);
-
-  const token = await getTenantAccessToken();
-  const res = await fetch(`${FEISHU_HOST}/open-apis/drive/v1/medias/upload_all`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}` },
-    body: form,
-  });
-  const data = await res.json();
-  if (data.code !== 0) {
-    throw new Error(`飞书附件上传失败: ${data.msg}`);
-  }
-  const fileToken = data.data?.file_token;
-  if (!fileToken) {
-    throw new Error(`上传完成但未返回 file_token: ${JSON.stringify(data.data)}`);
-  }
-  return fileToken;
-}
-
-async function uploadMultipartMedia(appToken, filePath) {
-  const buffer = fs.readFileSync(filePath);
-  const fileName = path.basename(filePath);
-  const size = buffer.length;
-
-  const prepare = await feishuRequest('POST', '/open-apis/drive/v1/medias/upload_prepare', {
-    body: {
-      file_name: fileName,
-      parent_type: 'bitable_file',
-      parent_node: appToken,
-      size,
-    },
-  });
-
-  const {
-    upload_id: uploadId,
-    block_size: blockSize = 4 * 1024 * 1024,
-    block_num: blockNum,
-  } = prepare;
-  let offset = 0;
-  let seq = 0;
-
-  while (offset < size) {
-    const chunk = buffer.subarray(offset, Math.min(offset + blockSize, size));
+  return withUploadSlot(async () => {
+    const buffer = fs.readFileSync(filePath);
+    const fileName = path.basename(filePath);
+    const size = buffer.length;
     const form = new FormData();
-    form.append('upload_id', uploadId);
-    form.append('seq', String(seq));
-    form.append('size', String(chunk.length));
-    form.append('file', new Blob([chunk]), fileName);
+    form.append('file_name', fileName);
+    form.append('parent_type', 'bitable_file');
+    form.append('parent_node', appToken);
+    form.append('size', String(size));
+    form.append('file', new Blob([buffer]), fileName);
 
     const token = await getTenantAccessToken();
-    const res = await fetch(`${FEISHU_HOST}/open-apis/drive/v1/medias/upload_part`, {
+    const res = await fetchWithRetry(`${FEISHU_HOST}/open-apis/drive/v1/medias/upload_all`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}` },
       body: form,
     });
     const data = await res.json();
     if (data.code !== 0) {
-      throw new Error(`飞书分片上传失败(seq=${seq}): ${data.msg}`);
+      throw new Error(`飞书附件上传失败: ${data.msg}`);
     }
-
-    if ((seq + 1) % 10 === 0 || offset + chunk.length >= size) {
-      const pct = Math.min(100, Math.round(((offset + chunk.length) / size) * 100));
-      console.log(`  分片进度: ${pct}% (${seq + 1} 片)`);
+    const fileToken = data.data?.file_token;
+    if (!fileToken) {
+      throw new Error(`上传完成但未返回 file_token: ${JSON.stringify(data.data)}`);
     }
-
-    offset += chunk.length;
-    seq += 1;
-  }
-
-  const uploadedBlocks = blockNum ?? seq;
-  if (blockNum != null && seq !== blockNum) {
-    throw new Error(`分片数量不一致: 已上传 ${seq} 片，预上传要求 ${blockNum} 片`);
-  }
-
-  const finish = await feishuRequest('POST', '/open-apis/drive/v1/medias/upload_finish', {
-    body: { upload_id: uploadId, block_num: uploadedBlocks },
+    return fileToken;
   });
-  const fileToken = finish.file_token;
-  if (!fileToken) {
-    throw new Error(`分片上传完成但未返回 file_token: ${JSON.stringify(finish)}`);
-  }
-  return fileToken;
+}
+
+async function uploadMultipartMedia(appToken, filePath) {
+  return withUploadSlot(async () => {
+    const buffer = fs.readFileSync(filePath);
+    const fileName = path.basename(filePath);
+    const size = buffer.length;
+
+    const prepare = await feishuRequest('POST', '/open-apis/drive/v1/medias/upload_prepare', {
+      body: {
+        file_name: fileName,
+        parent_type: 'bitable_file',
+        parent_node: appToken,
+        size,
+      },
+    });
+
+    const {
+      upload_id: uploadId,
+      block_size: blockSize = 4 * 1024 * 1024,
+      block_num: blockNum,
+    } = prepare;
+    let offset = 0;
+    let seq = 0;
+
+    while (offset < size) {
+      const chunk = buffer.subarray(offset, Math.min(offset + blockSize, size));
+      const form = new FormData();
+      form.append('upload_id', uploadId);
+      form.append('seq', String(seq));
+      form.append('size', String(chunk.length));
+      form.append('file', new Blob([chunk]), fileName);
+
+      const token = await getTenantAccessToken();
+      const res = await fetchWithRetry(`${FEISHU_HOST}/open-apis/drive/v1/medias/upload_part`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        body: form,
+      });
+      const data = await res.json();
+      if (data.code !== 0) {
+        throw new Error(`飞书分片上传失败(seq=${seq}): ${data.msg}`);
+      }
+
+      if ((seq + 1) % 10 === 0 || offset + chunk.length >= size) {
+        const pct = Math.min(100, Math.round(((offset + chunk.length) / size) * 100));
+        console.log(`  分片进度: ${pct}% (${seq + 1} 片)`);
+      }
+
+      offset += chunk.length;
+      seq += 1;
+    }
+
+    const uploadedBlocks = blockNum ?? seq;
+    if (blockNum != null && seq !== blockNum) {
+      throw new Error(`分片数量不一致: 已上传 ${seq} 片，预上传要求 ${blockNum} 片`);
+    }
+
+    const finish = await feishuRequest('POST', '/open-apis/drive/v1/medias/upload_finish', {
+      body: { upload_id: uploadId, block_num: uploadedBlocks },
+    });
+    const fileToken = finish.file_token;
+    if (!fileToken) {
+      throw new Error(`分片上传完成但未返回 file_token: ${JSON.stringify(finish)}`);
+    }
+    return fileToken;
+  });
 }
 
 async function uploadMedia(appToken, filePath) {
@@ -296,11 +390,41 @@ async function uploadMedia(appToken, filePath) {
 }
 
 async function uploadAttachmentToField(appToken, tableId, recordId, fieldName, filePath) {
-  const fileToken = await uploadMedia(appToken, filePath);
-  await updateRecord(appToken, tableId, recordId, {
-    [fieldName]: [{ file_token: fileToken }],
-  });
-  return fileToken;
+  const tokens = await uploadMultipleAttachmentsToField(appToken, tableId, recordId, fieldName, [filePath]);
+  return tokens[0]?.file_token;
+}
+
+async function uploadMultipleAttachmentsToField(appToken, tableId, recordId, fieldName, filePaths, options = {}) {
+  const existingAttachments = options.existingAttachments || [];
+  const uploadedNames = new Set(
+    existingAttachments.map((item) => item.name).filter(Boolean)
+  );
+  const attachmentValues = existingAttachments
+    .filter((item) => item.file_token)
+    .map((item) => ({ file_token: item.file_token }));
+
+  for (let i = 0; i < filePaths.length; i++) {
+    const filePath = filePaths[i];
+    const baseName = path.basename(filePath);
+    if (uploadedNames.has(baseName)) {
+      console.log(`  跳过已上传 [${i + 1}/${filePaths.length}]: ${baseName}`);
+      continue;
+    }
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`本地文件不存在: ${filePath}`);
+    }
+
+    console.log(`  上传附件 [${i + 1}/${filePaths.length}]: ${baseName}`);
+    const fileToken = await uploadMedia(appToken, filePath);
+    attachmentValues.push({ file_token: fileToken });
+    uploadedNames.add(baseName);
+
+    // 每传完一段即写入飞书，中断后可断点续传
+    await updateRecord(appToken, tableId, recordId, {
+      [fieldName]: attachmentValues,
+    });
+  }
+  return attachmentValues;
 }
 
 module.exports = {
@@ -319,6 +443,8 @@ module.exports = {
   batchDeleteRecords,
   batchUpdateRecords,
   listRecords,
+  listRecordsAll,
   deleteField,
   uploadAttachmentToField,
+  uploadMultipleAttachmentsToField,
 };

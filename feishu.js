@@ -74,31 +74,47 @@ function extractDate(timeStr) {
   return m ? m[1] : 'unknown';
 }
 
+async function scanRecords(appToken, tableId, predicate, label = '') {
+  const matched = [];
+  let pageToken;
+  let pageNum = 0;
+  let total;
+
+  console.log(`  扫描表内记录${label ? `（${label}）` : ''}...`);
+
+  do {
+    pageNum += 1;
+    const data = await api.listRecords(appToken, tableId, { pageSize: 500, pageToken });
+    total = data.total;
+    for (const item of data.items || []) {
+      if (predicate(item)) matched.push(item);
+    }
+    if (pageNum === 1 || pageNum % 5 === 0 || !data.has_more) {
+      console.log(`  已扫描 ${pageNum} 页 / 约 ${total ?? '?'} 条，匹配 ${matched.length} 条`);
+    }
+    pageToken = data.has_more ? data.page_token : undefined;
+  } while (pageToken);
+
+  return matched;
+}
+
 async function listRecordsForDate(appToken, tableId, date) {
-  return api.searchRecordsAll(appToken, tableId, {
-    filter: {
-      conjunction: 'and',
-      conditions: [{
-        field_name: '时间',
-        operator: 'contains',
-        value: [date],
-      }],
-    },
-    field_names: ['时间', SEQ_FIELD],
-  });
+  return scanRecords(
+    appToken,
+    tableId,
+    (item) => String(item.fields?.['时间'] || '').includes(date),
+    date
+  );
 }
 
 async function deleteRecordsForLiveAndDate(appToken, tableId, date, liveId) {
-  const items = await api.searchRecordsAll(appToken, tableId, {
-    filter: {
-      conjunction: 'and',
-      conditions: [
-        { field_name: '时间', operator: 'contains', value: [date] },
-        { field_name: LIVE_ID_FIELD, operator: 'is', value: [String(liveId)] },
-      ],
-    },
-    field_names: ['时间', LIVE_ID_FIELD],
-  });
+  const items = await scanRecords(
+    appToken,
+    tableId,
+    (item) => String(item.fields?.['时间'] || '').includes(date)
+      && String(item.fields?.['直播ID'] || '') === String(liveId),
+    `${date} 直播 ${liveId}`
+  );
   if (!items.length) return 0;
   const ids = items.map((item) => item.record_id).filter(Boolean);
   await api.batchDeleteRecords(appToken, tableId, ids);
@@ -389,13 +405,66 @@ function hasMatchingAttachment(attachments, filePath) {
   return attachments.some((item) => item.name === expectedName);
 }
 
-/** 音频上传完成或飞书已有同文件时，删除本地 mp3 及同名 mp4 */
-function cleanupLocalMediaPair(audioPath) {
-  const base = path.basename(audioPath, path.extname(audioPath));
+function hasAllSegmentAttachments(attachments, segmentPaths) {
+  if (!Array.isArray(segmentPaths) || segmentPaths.length === 0) return false;
+  if (!Array.isArray(attachments) || attachments.length === 0) return false;
+  const names = new Set(attachments.map((item) => item.name).filter(Boolean));
+  return segmentPaths.every((p) => names.has(path.basename(p)));
+}
+
+/** 从飞书附件名解析 part 序号，判断分段是否连续齐全（无需本地文件） */
+function isAudioUploadCompleteFromAttachments(attachments) {
+  const parts = (attachments || [])
+    .map((item) => item.name)
+    .filter(Boolean)
+    .map((name) => name.match(/_part(\d+)\.mp3$/i)?.[1])
+    .filter(Boolean)
+    .map((n) => parseInt(n, 10))
+    .sort((a, b) => a - b);
+  if (!parts.length) return false;
+  const max = parts[parts.length - 1];
+  if (parts.length !== max) return false;
+  for (let i = 1; i <= max; i += 1) {
+    if (!parts.includes(i)) return false;
+  }
+  return true;
+}
+
+async function checkAudioUploadedToFeishu({ date, name, liveId }) {
+  const config = loadFeishuConfig();
+  const tableId = await ensureVideoTable(config);
+  const existing = await findVideoRecord(config.baseToken, tableId, date, name, liveId);
+  if (!existing) return { complete: false, segmentCount: 0 };
+  const attachments = existing.fields?.['音频'] || [];
+  return {
+    complete: isAudioUploadCompleteFromAttachments(attachments),
+    segmentCount: attachments.length,
+    recordId: existing.record_id,
+  };
+}
+
+function deriveMediaBaseStem(anyAudioPath) {
+  const base = path.basename(anyAudioPath, path.extname(anyAudioPath));
+  return base.replace(/_part\d+$/i, '');
+}
+
+/** 音频上传完成或飞书已有同文件时，删除本地 mp3 分段、整段 mp3 及同名 mp4 */
+function cleanupLocalMediaPair(audioPathOrSegment, segmentPaths = []) {
+  const baseStem = deriveMediaBaseStem(
+    segmentPaths[0] || audioPathOrSegment
+  );
+  const audioDir = appConfig.audioDownloadDir;
   const candidates = [
-    audioPath,
-    path.join(appConfig.videoDownloadDir, `${base}.mp4`),
+    path.join(audioDir, `${baseStem}.mp3`),
+    path.join(appConfig.videoDownloadDir, `${baseStem}.mp4`),
   ];
+  if (fs.existsSync(audioDir)) {
+    for (const f of fs.readdirSync(audioDir)) {
+      if (f.startsWith(`${baseStem}_part`) && /\.mp3$/i.test(f)) {
+        candidates.push(path.join(audioDir, f));
+      }
+    }
+  }
   for (const filePath of candidates) {
     if (!fs.existsSync(filePath)) continue;
     fs.unlinkSync(filePath);
@@ -403,23 +472,52 @@ function cleanupLocalMediaPair(audioPath) {
   }
 }
 
-async function uploadAudioToFeishu({ date, name, liveId, filePath }) {
+async function uploadMultipleAttachmentsToRecord({
+  appToken, tableId, recordId, fieldName, filePaths, label, existingAttachments = [],
+}) {
+  let totalMb = 0;
+  for (const filePath of filePaths) {
+    if (fs.existsSync(filePath)) totalMb += fs.statSync(filePath).size;
+  }
+  console.log(`\n上传飞书${label}: ${filePaths.length} 个文件 (合计 ${(totalMb / 1024 / 1024).toFixed(1)} MB)`);
+  const overThreshold = filePaths.some(
+    (p) => fs.existsSync(p) && fs.statSync(p).size > appConfig.multipartUploadThreshold
+  );
+  if (overThreshold) {
+    console.log('  部分文件超过 20MB，将自动分片上传');
+  }
+  console.log('  开始上传附件，请耐心等待...');
+  await api.uploadMultipleAttachmentsToField(
+    appToken, tableId, recordId, fieldName, filePaths, { existingAttachments }
+  );
+  console.log('  附件上传完成');
+}
+
+async function uploadAudioToFeishu({ date, name, liveId, filePath, filePaths }) {
+  const paths = (filePaths && filePaths.length)
+    ? filePaths
+    : (filePath ? [filePath] : []);
+  if (!paths.length) {
+    throw new Error('uploadAudioToFeishu: 缺少 filePaths 或 filePath');
+  }
+
   const config = loadFeishuConfig();
   const tableId = await ensureVideoTable(config);
   await ensureAudioField(config.baseToken, tableId);
   const recordName = buildFeishuRecordName(liveId, name);
 
   const existing = await findVideoRecord(config.baseToken, tableId, date, name, liveId);
+  let existingAttachments = [];
   if (existing) {
-    const attachments = existing.fields?.['音频'] || [];
-    if (hasMatchingAttachment(attachments, filePath)) {
-      console.log(`  已存在且已有音频附件，跳过: ${recordName}`);
-      cleanupLocalMediaPair(filePath);
+    existingAttachments = existing.fields?.['音频'] || [];
+    if (hasAllSegmentAttachments(existingAttachments, paths)) {
+      console.log(`  已存在且音频分段齐全，跳过: ${recordName}`);
+      cleanupLocalMediaPair(paths[0], paths);
       return { skipped: true, reason: 'already_uploaded' };
     }
-    if (attachments.length > 0) {
-      const names = attachments.map((item) => item.name).filter(Boolean).join(', ') || '(未知文件名)';
-      console.log(`  已有音频附件但不匹配，将覆盖: ${names}`);
+    if (existingAttachments.length > 0) {
+      const names = existingAttachments.map((item) => item.name).filter(Boolean).join(', ') || '(未知文件名)';
+      console.log(`  已有 ${existingAttachments.length} 个附件，断点续传: ${names}`);
     }
   }
 
@@ -435,17 +533,18 @@ async function uploadAudioToFeishu({ date, name, liveId, filePath }) {
     console.log(`  复用已有记录: ${recordId}`);
   }
 
-  await uploadAttachmentToRecord({
+  await uploadMultipleAttachmentsToRecord({
     appToken: config.baseToken,
     tableId,
     recordId,
     fieldName: '音频',
-    filePath,
+    filePaths: paths,
     label: '音频',
+    existingAttachments,
   });
 
-  cleanupLocalMediaPair(filePath);
-  return { uploaded: true, recordId, tableId };
+  cleanupLocalMediaPair(paths[0], paths);
+  return { uploaded: true, recordId, tableId, segmentCount: paths.length };
 }
 
 async function importBarrageToFeishu(filePath, hintText = '', options = {}) {
@@ -499,4 +598,6 @@ module.exports = {
   ensureVideoTable,
   uploadVideoToFeishu,
   uploadAudioToFeishu,
+  checkAudioUploadedToFeishu,
+  isAudioUploadCompleteFromAttachments,
 };
