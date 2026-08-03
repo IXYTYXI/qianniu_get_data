@@ -10,10 +10,27 @@
  *   npm run task-barrage -- --date yesterday --skip-login
  */
 
+const path = require('path');
+const { QianniuDownloader, parseArgs } = require('./index.js');
+
 const args = process.argv.slice(2);
 const hasMode = args.some((arg, i) => arg === '--mode' && args[i + 1]);
 if (!hasMode) {
   args.push('--mode', 'barrage-task');
 }
-process.argv = [process.argv[0], require('path').join(__dirname, 'index.js'), ...args];
-require('./index.js');
+process.argv = [process.argv[0], path.join(__dirname, 'index.js'), ...args];
+
+const options = parseArgs();
+const downloader = new QianniuDownloader(options);
+
+process.on('SIGINT', async () => {
+  console.log('\n关闭浏览器...');
+  await downloader.close();
+  process.exit(0);
+});
+
+downloader.run().catch(async (err) => {
+  console.error('致命错误:', err);
+  await downloader.close();
+  process.exit(1);
+});

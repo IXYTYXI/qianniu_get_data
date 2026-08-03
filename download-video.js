@@ -23,6 +23,7 @@ const {
   findRowByLiveId,
   printBanner,
   goToFirstPage,
+  dismissBlockingOverlays,
 } = require('./browser');
 const { uploadVideoToFeishu } = require('./feishu');
 
@@ -65,7 +66,8 @@ async function openControlCenter(context, page, live, listSearchOptions = {}) {
   if (newPage) {
     await newPage.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
   }
-  await targetPage.waitForTimeout(2000);
+  await targetPage.waitForTimeout(3000);
+  await dismissBlockingOverlays(targetPage, `中控台 ${live.id}`);
   return targetPage;
 }
 
