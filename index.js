@@ -406,6 +406,13 @@ class QianniuDownloader {
     if (newPage && !newPage.isClosed()) {
       await newPage.waitForTimeout(1000);
       await newPage.close();
+    } else if (!newPage) {
+      // 中控台在同一标签打开，必须回到列表才能处理下一场
+      console.log('  返回直播中心列表...');
+      await this.page.goto(config.centerUrl, { timeout: config.navigationTimeout });
+      await this.page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+      await this.page.waitForTimeout(1500);
+      await dismissBlockingOverlays(this.page, '返回列表');
     }
   }
 
@@ -592,6 +599,7 @@ class QianniuDownloader {
     if (uniqueLives.length === 0) {
       console.log(`未找到 ${this.targetDate} 的直播记录`);
     } else {
+      console.log(`\n=== 阶段1：逐场「点转码 → 导弹幕 → 上传飞书」（共 ${uniqueLives.length} 场）===`);
       console.log(`去重后处理 ${uniqueLives.length} 场直播`);
       for (let i = 0; i < uniqueLives.length; i++) {
         await this.processRow(uniqueLives[i].id, uniqueLives[i].rowText, i);
