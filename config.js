@@ -39,6 +39,9 @@ module.exports = {
   feishuUploadConcurrency: resolveFeishuUploadConcurrency(),
   /** 上传飞书前将单场 MP3 按秒切分（默认 1 小时一段） */
   audioSegmentSeconds: 3600,
+  /** 等待平台转码：轮询间隔（分钟）、最长等待（分钟） */
+  transcodePollMinutes: 5,
+  transcodeMaxWaitMinutes: 360,
 
   downloadDir: path.join(__dirname, 'downloads'),
   videoDownloadDir: path.join(__dirname, 'downloads', 'videos'),

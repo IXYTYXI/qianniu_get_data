@@ -39,6 +39,17 @@ function getWeekDatesUTC8() {
   return dates;
 }
 
+/** 含起止日的连续日期列表（东八区 YYYY-MM-DD） */
+function getDatesBetween(startDate, endDate) {
+  const dates = [];
+  let cur = startDate;
+  while (cur <= endDate) {
+    dates.push(cur);
+    cur = addDaysToDateStr(cur, 1);
+  }
+  return dates;
+}
+
 function addDaysToDateStr(dateStr, days) {
   const match = String(dateStr).match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (!match) return dateStr;
@@ -78,6 +89,7 @@ function parseCliArgs(argv, defaults = {}) {
       case '--keep-browser': options.keepBrowser = true; break;
       case '--upload-only': options.uploadOnly = true; break;
       case '--audio-only': options.audioOnly = true; break;
+      case '--skip-transcode-wait': options.skipTranscodeWait = true; break;
     }
   }
   return options;
@@ -88,6 +100,7 @@ module.exports = {
   getYesterdayUTC8,
   getTodayUTC8,
   getWeekDatesUTC8,
+  getDatesBetween,
   getMonthUTC8,
   addDaysToDateStr,
   buildCenterFilterRange,

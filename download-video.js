@@ -137,11 +137,7 @@ async function returnToLiveList(page, targetDate) {
   await goToFirstPage(page);
 }
 
-/**
- * 检查转码状态并点击下载；saveAs 在后台进行，不阻塞返回。
- * 返回 downloaded（本地已有）| downloading（含 promise）| 其他跳过状态。
- */
-async function triggerVideoDownload(targetPage, live) {
+async function checkVideoDownloadStatus(targetPage, live) {
   console.log(`检查转码状态: ${live.id} ${live.name}`);
 
   const replayDownload = targetPage.locator(
@@ -174,36 +170,77 @@ async function triggerVideoDownload(targetPage, live) {
   console.log(`  下载按钮状态: 「${btnText}」`);
 
   if (/转码中|处理中|请稍后/.test(btnText)) {
-    console.log(`直播 ${live.id} 仍在转码中，跳过`);
     await closeDialog(dialog);
-    return { status: 'transcoding' };
+    return { status: 'transcoding', btnText };
   }
 
   if (/^开始|发起|点击转码/.test(btnText) || (/转码/.test(btnText) && !/下载/.test(btnText))) {
-    console.log(`直播 ${live.id} 尚未转码完成（${btnText}），跳过`);
     await closeDialog(dialog);
     return { status: 'not_ready', btnText };
   }
 
   if (!/网页直接下载|下载MP4|下载.*视频/.test(btnText)) {
-    console.log(`直播 ${live.id} 按钮状态不可下载: ${btnText}`);
     await closeDialog(dialog);
     return { status: 'unknown_button', btnText };
   }
 
   if (await actionBtn.isDisabled().catch(() => false)) {
-    console.log(`直播 ${live.id} 下载按钮不可用: ${btnText}`);
     await closeDialog(dialog);
     return { status: 'disabled', btnText };
   }
 
   const existingPath = findLocalVideo(live);
   if (existingPath && fs.statSync(existingPath).size > 0) {
-    const sizeMb = (fs.statSync(existingPath).size / 1024 / 1024).toFixed(1);
-    console.log(`  本地已有视频，跳过下载: ${existingPath} (${sizeMb} MB)`);
     await closeDialog(dialog);
-    return { status: 'downloaded', filePath: existingPath, skippedDownload: true };
+    return { status: 'downloaded', filePath: existingPath, skippedDownload: true, btnText };
   }
+
+  await closeDialog(dialog);
+  return { status: 'ready', btnText };
+}
+
+/**
+ * 检查转码状态并点击下载；saveAs 在后台进行，不阻塞返回。
+ * 返回 downloaded（本地已有）| downloading（含 promise）| 其他跳过状态。
+ */
+async function triggerVideoDownload(targetPage, live) {
+  const check = await checkVideoDownloadStatus(targetPage, live);
+
+  if (check.status === 'transcoding') {
+    console.log(`直播 ${live.id} 仍在转码中，跳过`);
+    return { status: 'transcoding' };
+  }
+  if (check.status === 'not_ready') {
+    console.log(`直播 ${live.id} 尚未转码完成（${check.btnText}），跳过`);
+    return { status: 'not_ready', btnText: check.btnText };
+  }
+  if (check.status === 'unknown_button') {
+    console.log(`直播 ${live.id} 按钮状态不可下载: ${check.btnText}`);
+    return { status: 'unknown_button', btnText: check.btnText };
+  }
+  if (check.status === 'disabled') {
+    console.log(`直播 ${live.id} 下载按钮不可用: ${check.btnText}`);
+    return { status: 'disabled', btnText: check.btnText };
+  }
+  if (check.status === 'downloaded') {
+    const sizeMb = (fs.statSync(check.filePath).size / 1024 / 1024).toFixed(1);
+    console.log(`  本地已有视频，跳过下载: ${check.filePath} (${sizeMb} MB)`);
+    return { status: 'downloaded', filePath: check.filePath, skippedDownload: true };
+  }
+  if (check.status !== 'ready') {
+    return check;
+  }
+
+  // 重新打开对话框并点击下载
+  const replayDownload = targetPage.locator(
+    '.nav-list li:has-text("回放下载"), .sidebar li:has-text("回放下载"), ' +
+    '.left-nav :text-is("回放下载"), li.tabs:has-text("回放下载"), span:has-text("回放下载")'
+  ).first();
+  await replayDownload.click();
+  await targetPage.waitForTimeout(2000);
+  const dialog = targetPage.locator('.el-dialog__wrapper:visible').filter({ hasText: '下载视频' }).last();
+  const actionBtn = dialog.locator('.el-dialog__body button').first();
+  const btnText = check.btnText;
 
   console.log(`  [${live.id}] 发起下载: ${btnText}`);
   const [download] = await Promise.all([
@@ -238,6 +275,72 @@ async function downloadTranscodedVideo(targetPage, live) {
     return result.promise;
   }
   return result;
+}
+
+async function checkLiveDownloadStatus(context, page, live, targetDate, listSearchOptions) {
+  const targetPage = await openControlCenter(context, page, live, listSearchOptions);
+  if (!targetPage) return { liveId: live.id, status: 'no_control' };
+
+  const openedNewTab = targetPage !== page;
+  try {
+    return { liveId: live.id, live, ...(await checkVideoDownloadStatus(targetPage, live)) };
+  } finally {
+    if (openedNewTab && !targetPage.isClosed()) {
+      await targetPage.close().catch(() => {});
+      await page.bringToFront().catch(() => {});
+    } else if (!openedNewTab && targetDate) {
+      await returnToLiveList(page, targetDate);
+    }
+  }
+}
+
+function isLiveDownloadReady(status) {
+  return status === 'ready' || status === 'downloaded';
+}
+
+/**
+ * 轮询等待所有场次平台转码完成（可下载）
+ */
+async function waitForLivesTranscodeReady(context, page, lives, targetDate, listSearchOptions, options = {}) {
+  const pollMinutes = options.transcodePollMinutes ?? config.transcodePollMinutes ?? 5;
+  const maxWaitMinutes = options.transcodeMaxWaitMinutes ?? config.transcodeMaxWaitMinutes ?? 360;
+  const deadline = Date.now() + maxWaitMinutes * 60_000;
+  let round = 0;
+
+  console.log(`\n=== 等待平台转码完成（每 ${pollMinutes} 分钟检查，最多 ${maxWaitMinutes} 分钟）===`);
+
+  while (Date.now() < deadline) {
+    round += 1;
+    const pending = [];
+    const ready = [];
+
+    for (const live of lives) {
+      const result = await checkLiveDownloadStatus(context, page, live, targetDate, listSearchOptions);
+      if (isLiveDownloadReady(result.status)) {
+        ready.push(live.id);
+      } else if (result.status === 'transcoding' || result.status === 'not_ready') {
+        pending.push({ id: live.id, status: result.status, btnText: result.btnText });
+      } else {
+        console.log(`  [${live.id}] 状态异常: ${result.status}，不再等待转码`);
+        ready.push(live.id);
+      }
+    }
+
+    console.log(`  第 ${round} 轮: 可下载 ${ready.length}/${lives.length}${pending.length ? `，仍转码 ${pending.map((p) => p.id).join(', ')}` : ''}`);
+
+    if (pending.length === 0) {
+      console.log('  全部场次已可下载\n');
+      return { ready: lives, pending: [] };
+    }
+
+    const waitMs = pollMinutes * 60_000;
+    console.log(`  ${pollMinutes} 分钟后重试...`);
+    await page.waitForTimeout(waitMs);
+    await returnToLiveList(page, targetDate);
+  }
+
+  console.log('  等待转码超时，将仅下载已就绪场次');
+  return { ready: lives, pending: [], timedOut: true };
 }
 
 async function triggerDownloadLive(context, page, live, targetDate, listSearchOptions = {}) {
@@ -447,6 +550,10 @@ if (require.main === module) {
 
 module.exports = {
   openControlCenter,
+  checkVideoDownloadStatus,
+  checkLiveDownloadStatus,
+  waitForLivesTranscodeReady,
+  isLiveDownloadReady,
   triggerVideoDownload,
   triggerDownloadLive,
   downloadTranscodedVideo,

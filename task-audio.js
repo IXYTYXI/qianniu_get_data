@@ -23,6 +23,7 @@ const {
 } = require('./browser');
 const {
   triggerDownloadLive,
+  waitForLivesTranscodeReady,
 } = require('./download-video');
 const {
   exportAudioSegmentsFromVideo,
@@ -41,6 +42,7 @@ function parseOptions(argv) {
     audioOnly: false,
   });
   if (argv.includes('--audio-only')) options.audioOnly = true;
+  if (argv.includes('--skip-transcode-wait')) options.skipTranscodeWait = true;
   return options;
 }
 
@@ -93,11 +95,15 @@ async function exportAndUploadOne(meta, displayName, { awaitUpload = true } = {}
   return { exportResults, uploadSummary };
 }
 
-function schedulePostDownload(live, filePath, transcodeResults) {
+function schedulePostDownload(live, filePath, uploadSummary) {
   const meta = parseVideoFilename(filePath);
   const displayName = live.name || meta?.name || `直播${live.id}`;
-  return transcodeOne({ ...meta, videoPath: filePath }, displayName).then((item) => {
-    transcodeResults.push(item);
+  return exportAndUploadOne(
+    { ...meta, videoPath: filePath },
+    displayName,
+    { awaitUpload: true }
+  ).then(({ uploadSummary: us }) => {
+    uploadSummary.push(...us);
   });
 }
 
@@ -146,7 +152,6 @@ async function processLivesPipeline(options, targetDate, session = null) {
 
   const downloadResults = [];
   const uploadSummary = [];
-  const transcodeResults = [];
 
   try {
     if (ownsBrowser) {
@@ -173,7 +178,13 @@ async function processLivesPipeline(options, targetDate, session = null) {
     await filterByDate(page, targetDate);
     await goToFirstPage(page);
 
-    console.log(`=== 流水线：连续发起下载，下完即转音频并上传（共 ${lives.length} 场）===\n`);
+    if (!options.skipTranscodeWait) {
+      await waitForLivesTranscodeReady(context, page, lives, targetDate, listSearchOptions, options);
+    } else {
+      console.log('\n=== 跳过等待平台转码（--skip-transcode-wait）===\n');
+    }
+
+    console.log(`=== 阶段2：连续发起下载（不等待落盘），下完即 ffmpeg + 上传（共 ${lives.length} 场）===\n`);
 
     const downloadPromises = [];
     const postProcessTasks = [];
@@ -204,7 +215,7 @@ async function processLivesPipeline(options, targetDate, session = null) {
 
       if (dl.status === 'downloaded' && dl.filePath) {
         downloadResults.push({ liveId: live.id, live, ...dl });
-        postProcessTasks.push(schedulePostDownload(live, dl.filePath, transcodeResults));
+        postProcessTasks.push(schedulePostDownload(live, dl.filePath, uploadSummary));
         continue;
       }
 
@@ -217,9 +228,9 @@ async function processLivesPipeline(options, targetDate, session = null) {
               downloadResults[idx] = { liveId: live.id, live, ...completed };
             }
             if (completed.status === 'downloaded' && completed.filePath) {
-              console.log(`\n--- ${live.id} 下载完成，开始转音频 ---`);
+              console.log(`\n--- ${live.id} 下载完成，开始转音频并上传 ---`);
               postProcessTasks.push(
-                schedulePostDownload(live, completed.filePath, transcodeResults)
+                schedulePostDownload(live, completed.filePath, uploadSummary)
               );
             }
             return completed;
@@ -237,7 +248,7 @@ async function processLivesPipeline(options, targetDate, session = null) {
     }
 
     if (postProcessTasks.length) {
-      console.log('\n等待转音频任务完成...');
+      console.log('\n等待各场 ffmpeg + 飞书上传完成...');
       await Promise.all(postProcessTasks);
     }
   } finally {
@@ -246,9 +257,6 @@ async function processLivesPipeline(options, targetDate, session = null) {
       await context.close().catch(() => {});
     }
   }
-
-  const queuedUploads = await runUploadQueue(transcodeResults);
-  uploadSummary.push(...queuedUploads);
 
   return {
     downloadResults,
@@ -295,7 +303,7 @@ async function main() {
   const targetDate = resolveTargetDate(options.date);
 
   printBanner('定时任务2：下载视频 → 导出音频 → 上传飞书', targetDate);
-  console.log('流程: 连续发起下载（后台并行）→ 下完即 ffmpeg → 关闭浏览器 → 并发上传飞书\n');
+  console.log('流程: 等待平台转码 → 连续发起下载 → 每场下完即 ffmpeg + 上传飞书\n');
 
   let downloadResults = [];
   let exportResults = [];
@@ -365,4 +373,6 @@ module.exports = {
   parseOptions,
   processLivesPipeline,
   exportAndUploadAudio,
+  exportAndUploadOne,
+  uploadOne,
 };
