@@ -194,6 +194,30 @@ async function createTable(appToken, tableName, fields) {
   return data.table_id || data.table?.table_id;
 }
 
+async function createBitableApp(name, options = {}) {
+  const data = await feishuRequest('POST', '/open-apis/bitable/v1/apps', {
+    body: {
+      name,
+      folder_token: options.folderToken,
+      time_zone: options.timeZone || 'Asia/Shanghai',
+    },
+  });
+  return data.app;
+}
+
+async function copyBitableApp(appToken, options = {}) {
+  const data = await feishuRequest('POST', `/open-apis/bitable/v1/apps/${appToken}/copy`, {
+    body: {
+      name: options.name,
+      folder_token: options.folderToken,
+      without_content: options.withoutContent !== false,
+      time_zone: options.timeZone || 'Asia/Shanghai',
+    },
+    timeoutMs: 300_000,
+  });
+  return data.app;
+}
+
 async function batchCreateRecords(appToken, tableId, records) {
   const data = await feishuRequest('POST', appPath(appToken, `/tables/${tableId}/records/batch_create`), {
     body: { records },
@@ -435,6 +459,8 @@ module.exports = {
   createField,
   listTables,
   createTable,
+  createBitableApp,
+  copyBitableApp,
   batchCreateRecords,
   createRecord,
   updateRecord,

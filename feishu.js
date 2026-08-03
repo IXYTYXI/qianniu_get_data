@@ -29,6 +29,134 @@ function loadFeishuConfig() {
   return JSON.parse(fs.readFileSync(FEISHU_CONFIG_PATH, 'utf8'));
 }
 
+function monthFromDate(dateStr) {
+  return String(dateStr).slice(0, 7);
+}
+
+function archivedConfigPath(month) {
+  return path.join(__dirname, `feishu.config.${month}.json`);
+}
+
+function isAutoMonthEnabled(config) {
+  if (process.env.FEISHU_AUTO_MONTH === '0') return false;
+  if (process.env.FEISHU_AUTO_MONTH === '1') return true;
+  return config.autoCreateMonthly === true;
+}
+
+function buildBaseName(config, month) {
+  if (config.baseNamePattern) {
+    return String(config.baseNamePattern).replace('{month}', month);
+  }
+  return `直播弹幕-${month}`;
+}
+
+function saveFeishuConfig(config) {
+  fs.writeFileSync(FEISHU_CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`);
+}
+
+function archiveFeishuConfig(config) {
+  if (!config?.month) return;
+  const archivePath = archivedConfigPath(config.month);
+  fs.writeFileSync(archivePath, `${JSON.stringify(config, null, 2)}\n`);
+  console.log(`  已归档配置: ${path.basename(archivePath)}`);
+}
+
+function restoreArchivedConfig(month) {
+  const archivePath = archivedConfigPath(month);
+  if (!fs.existsSync(archivePath)) return null;
+  const config = JSON.parse(fs.readFileSync(archivePath, 'utf8'));
+  saveFeishuConfig(config);
+  console.log(`已切换飞书配置到 ${month}（读取归档 ${path.basename(archivePath)}）`);
+  return config;
+}
+
+async function mapTablesFromBase(appToken, config) {
+  const tables = await api.listTables(appToken);
+  const mapped = {};
+  for (const [school, spec] of Object.entries(config.tables || {})) {
+    const found = tables.find((t) => t.name === spec.name);
+    if (!found) {
+      throw new Error(`新 Base 中未找到表「${spec.name}」，请检查模板 Base 结构`);
+    }
+    mapped[school] = { name: spec.name, tableId: found.table_id };
+  }
+
+  const videoName = config.videoTable?.name || VIDEO_TABLE_NAME;
+  let videoTable = tables.find((t) => t.name === videoName);
+  if (!videoTable) {
+    console.log(`  新 Base 无「${videoName}」，自动创建...`);
+    const tableId = await api.createTable(appToken, videoName, VIDEO_TABLE_FIELDS);
+    videoTable = { name: videoName, table_id: tableId };
+  }
+
+  return {
+    tables: mapped,
+    videoTable: { name: videoTable.name, tableId: videoTable.table_id },
+  };
+}
+
+async function createMonthlyBaseFromTemplate(config, neededMonth) {
+  const sourceToken = config.templateBaseToken || config.baseToken;
+  const baseName = buildBaseName(config, neededMonth);
+  console.log(`\n=== 自动创建 ${neededMonth} 多维表格（复制结构，不含数据）===`);
+  console.log(`  模板 Base: ${sourceToken}`);
+  console.log(`  新 Base 名称: ${baseName}`);
+
+  const copied = await api.copyBitableApp(sourceToken, {
+    name: baseName,
+    folderToken: config.folderToken,
+    withoutContent: true,
+  });
+
+  const mapped = await mapTablesFromBase(copied.app_token, config);
+  archiveFeishuConfig(config);
+
+  const newConfig = {
+    ...config,
+    month: neededMonth,
+    baseName,
+    baseToken: copied.app_token,
+    baseUrl: copied.url || config.baseUrl,
+    tables: mapped.tables,
+    videoTable: mapped.videoTable,
+    templateBaseToken: config.templateBaseToken || sourceToken,
+    autoCreateMonthly: config.autoCreateMonthly,
+    folderToken: config.folderToken,
+    baseNamePattern: config.baseNamePattern,
+  };
+
+  saveFeishuConfig(newConfig);
+  console.log(`  已写入 feishu.config.json，baseToken=${copied.app_token}\n`);
+  return newConfig;
+}
+
+/**
+ * 按目标日期确保 feishu.config.json 指向对应月份 Base。
+ * - 同月：不动作
+ * - 补历史月：读取 feishu.config.YYYY-MM.json 归档
+ * - 新月份：复制 templateBaseToken（或当前 Base）并更新配置
+ */
+async function ensureFeishuConfigForDate(targetDate) {
+  const config = loadFeishuConfig();
+  const neededMonth = monthFromDate(targetDate);
+  if (config.month === neededMonth) return config;
+  if (!isAutoMonthEnabled(config)) {
+    console.log(`  提示: 目标日期 ${targetDate} 属于 ${neededMonth}，当前配置 month=${config.month}；可开启 autoCreateMonthly 或设置 FEISHU_AUTO_MONTH=1`);
+    return config;
+  }
+
+  const restored = restoreArchivedConfig(neededMonth);
+  if (restored) return restored;
+
+  if (neededMonth < config.month) {
+    throw new Error(
+      `需要 ${neededMonth} 的 Base，当前为 ${config.month}，且不存在归档 ${path.basename(archivedConfigPath(neededMonth))}`
+    );
+  }
+
+  return createMonthlyBaseFromTemplate(config, neededMonth);
+}
+
 function detectSchoolLevel(text) {
   if (text.includes('【小学】') || text.includes('小学')) return '小学';
   if (text.includes('【初中】') || text.includes('初中')) return '初中';
@@ -591,6 +719,7 @@ async function importBarrageToFeishu(filePath, hintText = '', options = {}) {
 
 module.exports = {
   loadFeishuConfig,
+  ensureFeishuConfigForDate,
   detectSchoolLevel,
   extractLiveId,
   importBarrageToFeishu,

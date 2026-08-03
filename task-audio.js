@@ -31,7 +31,7 @@ const {
   parseVideoFilename,
   checkFfmpeg,
 } = require('./audio');
-const { uploadAudioToFeishu, checkAudioUploadedToFeishu } = require('./feishu');
+const { uploadAudioToFeishu, checkAudioUploadedToFeishu, ensureFeishuConfigForDate } = require('./feishu');
 
 function parseOptions(argv) {
   const options = parseCliArgs(argv, {
@@ -139,6 +139,8 @@ async function processLivesPipeline(options, targetDate, session = null) {
   if (!checkFfmpeg()) {
     throw new Error(`未找到 ffmpeg: ${config.ffmpegPath}`);
   }
+
+  await ensureFeishuConfigForDate(targetDate);
 
   const ownsBrowser = !session;
   let context;
@@ -304,6 +306,8 @@ async function main() {
 
   printBanner('定时任务2：下载视频 → 导出音频 → 上传飞书', targetDate);
   console.log('流程: 等待平台转码 → 连续发起下载 → 每场下完即 ffmpeg + 上传飞书\n');
+
+  await ensureFeishuConfigForDate(targetDate);
 
   let downloadResults = [];
   let exportResults = [];

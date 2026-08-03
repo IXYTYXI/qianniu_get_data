@@ -2,7 +2,7 @@ const { chromium } = require('playwright');
 const path = require('path');
 const fs = require('fs');
 const config = require('./config');
-const { importBarrageToFeishu } = require('./feishu');
+const { importBarrageToFeishu, ensureFeishuConfigForDate } = require('./feishu');
 const { triggerVideoDownload, findLocalVideo } = require('./download-video');
 const { findRowByLiveId, waitForLogin: waitForBrowserLogin, dismissBlockingOverlays, findLiveRows, filterByDate: browserFilterByDate } = require('./browser');
 
@@ -625,6 +625,8 @@ class QianniuDownloader {
         return { ok: false, reason: 'not_logged_in' };
       }
     }
+
+    await ensureFeishuConfigForDate(this.targetDate);
 
     await this.navigateToCenter();
     await this.filterByDate();

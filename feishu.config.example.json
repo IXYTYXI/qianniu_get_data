@@ -1,8 +1,12 @@
 {
-  "month": "2026-07",
-  "baseName": "直播弹幕-2026-07",
+  "month": "2026-08",
+  "baseName": "直播弹幕-2026-08",
+  "baseNamePattern": "直播弹幕-{month}",
   "baseToken": "YOUR_BASE_TOKEN",
   "baseUrl": "https://your-domain.feishu.cn/base/YOUR_BASE_TOKEN",
+  "autoCreateMonthly": true,
+  "templateBaseToken": "YOUR_TEMPLATE_OR_CURRENT_BASE_TOKEN",
+  "folderToken": "",
   "tables": {
     "小学": { "name": "小学弹幕", "tableId": "tblXXXXXXXX" },
     "初中": { "name": "初中弹幕", "tableId": "tblXXXXXXXX" },

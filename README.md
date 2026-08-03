@@ -236,6 +236,10 @@ cp feishu.config.example.json feishu.config.json
 
 每月新建 Base 后，更新 `feishu.config.json` 中的 `month`、`baseToken` 和各 `tableId`。
 
+**自动换月（推荐）：** 在 `feishu.config.json` 设置 `"autoCreateMonthly": true`，并填写 `templateBaseToken`（带完整表结构的模板 Base，通常填当前月 Base）。任务跑某天的数据前会检查目标日期所属月份；若为新月份，则调用飞书 API **复制 Base 结构（不含数据）**，自动写入新 `baseToken` / `tableId`，并把旧配置归档为 `feishu.config.YYYY-MM.json`。
+
+需在飞书开放平台为自建应用开通权限：`base:app:copy`（或 `base:app:create`）、`bitable:app`。
+
 > **注意：** 自建应用使用 `tenant_access_token`，代表企业身份访问。请确保目标 Base 属于同一飞书企业，且应用权限已由管理员审批通过。
 
 ### 3. 首次登录千牛
