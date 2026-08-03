@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const config = require('./config');
 const { importBarrageToFeishu } = require('./feishu');
+const { triggerVideoDownload, findLocalVideo } = require('./download-video');
 const { findRowByLiveId, waitForLogin: waitForBrowserLogin, dismissBlockingOverlays, findLiveRows, filterByDate: browserFilterByDate } = require('./browser');
 
 // ========== UTC+8 Timezone Helpers ==========
@@ -59,6 +60,7 @@ class QianniuDownloader {
     this.pendingDownloads = new Map();
     this.downloadTasks = new Set();
     this.suppressAutoDownloadHandler = false;
+    this.videoDownloadPromises = [];
     this.listSearchOptions = { dateFilterApplied: false };
     this.ownsContext = true;
 
@@ -77,7 +79,18 @@ class QianniuDownloader {
     }
 
     fs.mkdirSync(config.downloadDir, { recursive: true });
+    fs.mkdirSync(config.videoDownloadDir, { recursive: true });
     fs.mkdirSync(config.screenshotDir, { recursive: true });
+  }
+
+  buildLiveMeta(liveId, rowText = '') {
+    const timeMatch = rowText.match(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/);
+    return {
+      id: liveId,
+      date: (timeMatch?.[0] || this.targetDate).slice(0, 10),
+      name: (rowText.match(/【[^】]+】[^0-9]*/)?.[0] || '').trim(),
+      rowText,
+    };
   }
 
   async launch() {
@@ -371,7 +384,7 @@ class QianniuDownloader {
     await this.closeBlockingDialogs(targetPage, '进入中控台后');
 
     if (this.options.mode === 'transcode' || this.options.mode === 'all' || this.options.mode === 'barrage-task') {
-      await this.triggerTranscode(targetPage, liveId);
+      await this.triggerReplayAction(targetPage, this.buildLiveMeta(liveId, rowText));
     }
 
     await this.closeBlockingDialogs(targetPage, '转码检查后');
@@ -483,8 +496,8 @@ class QianniuDownloader {
     await targetPage.screenshot({ path: path.join(config.screenshotDir, `barrage-${liveId}.png`) });
   }
 
-  async triggerTranscode(targetPage, liveId) {
-    console.log('检查视频转码状态...');
+  async triggerReplayAction(targetPage, live) {
+    console.log('检查视频转码/下载状态...');
 
     const replayDownload = targetPage.locator(
       '.nav-list li:has-text("回放下载"), .sidebar li:has-text("回放下载"), ' +
@@ -496,30 +509,53 @@ class QianniuDownloader {
 
     const dialog = targetPage.locator('.el-dialog__wrapper:visible').filter({ hasText: '下载视频' }).last();
     if (!(await dialog.isVisible({ timeout: 5000 }).catch(() => false))) {
-      console.log('  未弹出「下载视频」对话框，停止转码操作');
+      console.log('  未弹出「下载视频」对话框，停止回放操作');
       return;
     }
 
     const actionBtn = dialog.locator('.el-dialog__body button').first();
     const btnText = ((await actionBtn.textContent().catch(() => '')) || '').replace(/\s+/g, ' ').trim();
-    console.log(`  转码按钮状态: 「${btnText}」`);
+    console.log(`  回放按钮状态: 「${btnText}」`);
+
+    const closeBtn = dialog.locator('.el-dialog__headerbtn').first();
+    const closeDialog = async () => {
+      await this.clickWhenReady(closeBtn, '关闭下载视频弹窗', { waitMs: 800 });
+    };
 
     if (/转码中|处理中|请稍后/.test(btnText)) {
-      console.log(`  直播 ${liveId} 已在转码中，不点击`);
+      console.log(`  直播 ${live.id} 已在转码中，不点击`);
+      await closeDialog();
     } else if (/网页直接下载|下载MP4|下载.*视频/.test(btnText)) {
-      console.log(`  视频已可下载（${btnText}），任务1仅触发转码不下载，跳过`);
+      if (this.options.mode === 'barrage-task') {
+        await closeDialog();
+        const existingPath = findLocalVideo(live);
+        if (existingPath) {
+          const sizeMb = (fs.statSync(existingPath).size / 1024 / 1024).toFixed(1);
+          console.log(`  视频已可下载，本地已有，跳过: ${existingPath} (${sizeMb} MB)`);
+        } else {
+          console.log(`  视频已可下载（${btnText}），任务1 后台发起下载，继续导弹幕...`);
+          const result = await triggerVideoDownload(targetPage, live);
+          if (result.promise) {
+            this.videoDownloadPromises.push(result.promise);
+          } else if (result.status === 'downloaded' && result.filePath) {
+            console.log(`  视频已在本地: ${result.filePath}`);
+          }
+        }
+      } else {
+        console.log(`  视频已可下载（${btnText}），当前模式不下载，跳过`);
+        await closeDialog();
+      }
     } else if (/转码|开始/.test(btnText)) {
       await this.clickWhenReady(actionBtn, '转码按钮', { waitMs: 2000 });
+      await closeDialog();
     } else {
-      console.log('  未识别转码按钮状态，不点击');
+      console.log('  未识别按钮状态，不点击');
+      await closeDialog();
     }
 
     await targetPage.screenshot({
-      path: path.join(config.screenshotDir, `transcode-${liveId}.png`),
+      path: path.join(config.screenshotDir, `transcode-${live.id}.png`),
     });
-
-    const closeBtn = dialog.locator('.el-dialog__headerbtn').first();
-    await this.clickWhenReady(closeBtn, '关闭下载视频弹窗', { waitMs: 800 });
   }
 
   async tryRecordingSection() {
@@ -621,6 +657,10 @@ class QianniuDownloader {
 
     console.log('等待所有下载完成...');
     await this.waitForAllDownloads();
+    if (this.videoDownloadPromises.length > 0) {
+      console.log(`等待 ${this.videoDownloadPromises.length} 个视频后台下载...`);
+      await Promise.all(this.videoDownloadPromises);
+    }
     await this.page.waitForTimeout(1000);
 
     if (shouldClose) {
