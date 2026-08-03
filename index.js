@@ -1,10 +1,9 @@
-const { chromium } = require('playwright');
 const path = require('path');
 const fs = require('fs');
 const config = require('./config');
 const { importBarrageToFeishu, ensureFeishuConfigForDate } = require('./feishu');
 const { triggerVideoDownload, findLocalVideo } = require('./download-video');
-const { findRowByLiveId, waitForLogin: waitForBrowserLogin, dismissBlockingOverlays, findLiveRows, filterByDate: browserFilterByDate } = require('./browser');
+const { findRowByLiveId, waitForLogin: waitForBrowserLogin, dismissBlockingOverlays, findLiveRows, filterByDate: browserFilterByDate, launchBrowser } = require('./browser');
 
 // ========== UTC+8 Timezone Helpers ==========
 
@@ -100,21 +99,12 @@ class QianniuDownloader {
     console.log(`下载模式: ${this.options.mode}`);
     console.log();
 
-    if (!config.chromePath) {
-      throw new Error(
-        '未找到 Chrome，请安装 Google Chrome 或设置 CHROME_PATH 环境变量指向 chrome.exe'
-      );
-    }
+    const headlessEnv = process.env.PLAYWRIGHT_HEADLESS;
+    const headless = headlessEnv != null
+      ? (headlessEnv === '1' || headlessEnv === 'true')
+      : false;
 
-    this.context = await chromium.launchPersistentContext(config.userDataDir, {
-      headless: false,
-      executablePath: config.chromePath,
-      viewport: { width: 1400, height: 900 },
-      args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
-      acceptDownloads: true,
-    });
-
-    this.page = this.context.pages()[0] || await this.context.newPage();
+    ({ context: this.context, page: this.page } = await launchBrowser({ headless }));
     this.attachDownloadHandler(this.context);
   }
 

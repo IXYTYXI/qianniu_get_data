@@ -5,17 +5,35 @@ const { execSync } = require('child_process');
 const config = require('./config');
 const { getTodayUTC8, buildCenterFilterRange } = require('./dates');
 
+function formatChromeLaunchError(err, profileDir) {
+  const logText = Array.isArray(err?.log) ? err.log.join('\n') : '';
+  const profileBusy = /existing browser session|profile|Singleton|已在运行|浏览器会话/i.test(
+    `${err?.message || ''}\n${logText}`
+  );
+  if (!profileBusy) return err;
+
+  const message = [
+    'Chrome 无法启动：Profile 正被其他 Chrome 进程占用。',
+    `Profile 路径: ${profileDir}`,
+    '请先关闭所有 Chrome 窗口，或在任务管理器结束 chrome.exe 后重试。',
+    '定时任务请勿手动打开使用同一 Profile 的 Chrome。',
+  ].join('\n');
+  const wrapped = new Error(message);
+  wrapped.cause = err;
+  return wrapped;
+}
+
 function ensureChromeProfileFree(profileDir = config.userDataDir) {
   const profile = profileDir;
   fs.mkdirSync(profile, { recursive: true });
+  const profileMarker = path.basename(profile);
 
   if (process.platform === 'win32') {
-    const escaped = profile.replace(/'/g, "''");
     try {
       execSync(
         'powershell -NoProfile -Command '
         + `"Get-CimInstance Win32_Process -Filter \\"Name='chrome.exe'\\" `
-        + `| Where-Object { $_.CommandLine -like '*${escaped}*' } `
+        + `| Where-Object { $_.CommandLine -like '*${profileMarker}*' } `
         + `| ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"`,
         { stdio: 'ignore', timeout: 15000 }
       );
@@ -24,7 +42,7 @@ function ensureChromeProfileFree(profileDir = config.userDataDir) {
     }
   } else {
     try {
-      execSync(`pkill -f "user-data-dir=${profile}"`, { stdio: 'ignore' });
+      execSync(`pkill -f "${profileMarker}"`, { stdio: 'ignore' });
     } catch {
       // no running chrome
     }
@@ -47,7 +65,20 @@ function ensureChromeProfileFree(profileDir = config.userDataDir) {
   }
 }
 
-async function launchBrowser() {
+async function launchPersistentContext(userDataDir, options = {}) {
+  const headless = options.headless
+    ?? (process.env.PLAYWRIGHT_HEADLESS === '1' || process.env.PLAYWRIGHT_HEADLESS === 'true');
+
+  return chromium.launchPersistentContext(userDataDir, {
+    headless,
+    executablePath: config.chromePath,
+    viewport: { width: 1400, height: 900 },
+    args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
+    acceptDownloads: true,
+  });
+}
+
+async function launchBrowser(options = {}) {
   if (!config.chromePath) {
     throw new Error('未找到 Chrome，请安装 Google Chrome 或设置 CHROME_PATH 环境变量');
   }
@@ -56,22 +87,29 @@ async function launchBrowser() {
   fs.mkdirSync(config.videoDownloadDir, { recursive: true });
   fs.mkdirSync(config.screenshotDir, { recursive: true });
 
-  const headless = process.env.PLAYWRIGHT_HEADLESS === '1' || process.env.PLAYWRIGHT_HEADLESS === 'true';
-  const userDataDir = process.env.CHROME_USER_DATA_DIR || config.userDataDir;
+  const userDataDir = options.userDataDir
+    || process.env.CHROME_USER_DATA_DIR
+    || config.userDataDir;
 
   ensureChromeProfileFree(userDataDir);
   await new Promise((r) => setTimeout(r, 1500));
 
-  const context = await chromium.launchPersistentContext(userDataDir, {
-    headless,
-    executablePath: config.chromePath,
-    viewport: { width: 1400, height: 900 },
-    args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
-    acceptDownloads: true,
-  });
-
-  const page = context.pages()[0] || await context.newPage();
-  return { context, page };
+  try {
+    const context = await launchPersistentContext(userDataDir, options);
+    const page = context.pages()[0] || await context.newPage();
+    return { context, page, userDataDir };
+  } catch (err) {
+    console.log('Chrome 首次启动失败，清理 Profile 锁后重试...');
+    ensureChromeProfileFree(userDataDir);
+    await new Promise((r) => setTimeout(r, 2000));
+    try {
+      const context = await launchPersistentContext(userDataDir, options);
+      const page = context.pages()[0] || await context.newPage();
+      return { context, page, userDataDir };
+    } catch (retryErr) {
+      throw formatChromeLaunchError(retryErr, userDataDir);
+    }
+  }
 }
 
 async function dismissBlockingOverlays(page, stage = '') {
