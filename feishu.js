@@ -95,6 +95,41 @@ async function mapTablesFromBase(appToken, config) {
   };
 }
 
+function resolveNotifyChatId(config) {
+  return process.env.FEISHU_NOTIFY_CHAT_ID || config.notifyChatId || '';
+}
+
+function buildBaseUrl(appToken, config, copiedUrl) {
+  if (copiedUrl) return copiedUrl;
+  if (config.baseUrl && config.baseToken) {
+    return String(config.baseUrl).replace(config.baseToken, appToken);
+  }
+  return `https://feishu.cn/base/${appToken}`;
+}
+
+async function notifyMonthlyBaseCreated(config, neededMonth, appToken, copiedUrl) {
+  const chatId = resolveNotifyChatId(config);
+  if (!chatId) {
+    console.log('  未配置 notifyChatId，跳过群通知');
+    return;
+  }
+
+  const baseUrl = buildBaseUrl(appToken, config, copiedUrl);
+  const text = [
+    `【千牛数据】${neededMonth} 直播弹幕多维表格已自动创建`,
+    `名称：${config.baseName || buildBaseName(config, neededMonth)}`,
+    `链接：${baseUrl}`,
+  ].join('\n');
+
+  try {
+    await api.sendChatTextMessage(chatId, text);
+    console.log(`  已发送 Base 链接到群聊: ${chatId}`);
+  } catch (err) {
+    console.log(`  群通知发送失败（不影响任务）: ${err.message}`);
+    console.log('  请确认：应用已加入该群，且已开通 im:message:send 或 im:message:send_as_bot 权限');
+  }
+}
+
 async function createMonthlyBaseFromTemplate(config, neededMonth) {
   const sourceToken = config.templateBaseToken || config.baseToken;
   const baseName = buildBaseName(config, neededMonth);
@@ -116,17 +151,19 @@ async function createMonthlyBaseFromTemplate(config, neededMonth) {
     month: neededMonth,
     baseName,
     baseToken: copied.app_token,
-    baseUrl: copied.url || config.baseUrl,
+    baseUrl: buildBaseUrl(copied.app_token, config, copied.url),
     tables: mapped.tables,
     videoTable: mapped.videoTable,
     templateBaseToken: config.templateBaseToken || sourceToken,
     autoCreateMonthly: config.autoCreateMonthly,
     folderToken: config.folderToken,
     baseNamePattern: config.baseNamePattern,
+    notifyChatId: config.notifyChatId,
   };
 
   saveFeishuConfig(newConfig);
   console.log(`  已写入 feishu.config.json，baseToken=${copied.app_token}\n`);
+  await notifyMonthlyBaseCreated(newConfig, neededMonth, copied.app_token, copied.url);
   return newConfig;
 }
 

@@ -451,6 +451,21 @@ async function uploadMultipleAttachmentsToField(appToken, tableId, recordId, fie
   return attachmentValues;
 }
 
+async function sendChatTextMessage(chatId, text) {
+  if (!chatId) {
+    throw new Error('sendChatTextMessage: 缺少 chatId');
+  }
+  const data = await feishuRequest('POST', '/open-apis/im/v1/messages', {
+    params: { receive_id_type: 'chat_id' },
+    body: {
+      receive_id: chatId,
+      msg_type: 'text',
+      content: JSON.stringify({ text }),
+    },
+  });
+  return data;
+}
+
 module.exports = {
   FIELD_TYPE,
   getAppCredentials,
@@ -473,4 +488,5 @@ module.exports = {
   deleteField,
   uploadAttachmentToField,
   uploadMultipleAttachmentsToField,
+  sendChatTextMessage,
 };
