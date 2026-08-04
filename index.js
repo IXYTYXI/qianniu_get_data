@@ -161,7 +161,12 @@ class QianniuDownloader {
         this.options.mode === 'barrage' ||
         this.options.mode === 'barrage-task'
       )) {
-        await importBarrageToFeishu(savePath, hintText, { liveId });
+        try {
+          await importBarrageToFeishu(savePath, hintText, { liveId });
+        } catch (e) {
+          console.log(`  [上传飞书失败] ${filename}: ${e.message}`);
+        }
+        return;
       }
     } catch (e) {
       console.log(`  [下载失败] ${filename}: ${e.message}`);
