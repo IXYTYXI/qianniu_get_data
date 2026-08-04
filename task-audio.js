@@ -31,7 +31,7 @@ const {
   parseVideoFilename,
   checkFfmpeg,
 } = require('./audio');
-const { uploadAudioToFeishu, checkAudioUploadedToFeishu, ensureFeishuConfigForDate } = require('./feishu');
+const { uploadAudioToFeishu, checkAudioUploadedToFeishu, ensureFeishuConfigForDate, loadFeishuConfig } = require('./feishu');
 
 function parseOptions(argv) {
   const options = parseCliArgs(argv, {
@@ -142,6 +142,13 @@ async function processLivesPipeline(options, targetDate, session = null) {
 
   await ensureFeishuConfigForDate(targetDate);
 
+  let feishuConfig;
+  try {
+    feishuConfig = loadFeishuConfig();
+  } catch {
+    feishuConfig = null;
+  }
+
   const ownsBrowser = !session;
   let context;
   let page;
@@ -170,7 +177,7 @@ async function processLivesPipeline(options, targetDate, session = null) {
     await page.waitForTimeout(2000);
 
     const filterResult = await filterByDate(page, targetDate);
-    const listSearchOptions = { dateFilterApplied: filterResult.applied };
+    const listSearchOptions = { dateFilterApplied: filterResult.applied, feishuConfig };
     const lives = await findLiveRows(page, targetDate, listSearchOptions);
     if (!lives.length) {
       console.log(`未找到 ${targetDate} 的直播记录`);

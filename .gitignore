@@ -3,5 +3,6 @@ node_modules/
 downloads/
 screenshots/
 feishu.config.json
+feishu.config.20*.json
 logs/
 .env

@@ -1,7 +1,7 @@
 const path = require('path');
 const fs = require('fs');
 const config = require('./config');
-const { importBarrageToFeishu, ensureFeishuConfigForDate } = require('./feishu');
+const { importBarrageToFeishu, ensureFeishuConfigForDate, loadFeishuConfig } = require('./feishu');
 const { triggerVideoDownload, findLocalVideo } = require('./download-video');
 const { findRowByLiveId, waitForLogin: waitForBrowserLogin, dismissBlockingOverlays, findLiveRows, filterByDate: browserFilterByDate, launchBrowser } = require('./browser');
 
@@ -618,10 +618,20 @@ class QianniuDownloader {
 
     await ensureFeishuConfigForDate(this.targetDate);
 
+    let feishuConfig;
+    try {
+      feishuConfig = loadFeishuConfig();
+    } catch {
+      feishuConfig = null;
+    }
+
     await this.navigateToCenter();
     await this.filterByDate();
 
-    const lives = await findLiveRows(this.page, this.targetDate, this.listSearchOptions);
+    const lives = await findLiveRows(this.page, this.targetDate, {
+      ...this.listSearchOptions,
+      feishuConfig,
+    });
     const uniqueLives = lives.map((live) => ({ id: live.id, rowText: live.rowText || '' }));
 
     if (uniqueLives.length === 0) {

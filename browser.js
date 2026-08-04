@@ -4,6 +4,7 @@ const fs = require('fs');
 const { execSync } = require('child_process');
 const config = require('./config');
 const { getTodayUTC8, buildCenterFilterRange } = require('./dates');
+const { shouldIncludeLiveRow, describeSchoolMode, shouldApplySchoolFilter } = require('./school-level');
 
 function formatChromeLaunchError(err, profileDir) {
   const logText = Array.isArray(err?.log) ? err.log.join('\n') : '';
@@ -382,13 +383,15 @@ function parseLiveFromRowText(text, targetDate) {
   };
 }
 
-async function collectLiveRowsFromCurrentPage(page, targetDate, seen, lives) {
+async function collectLiveRowsFromCurrentPage(page, targetDate, seen, lives, options = {}) {
   const allRows = getTableRows(page);
   const rowCount = await allRows.count();
+  const feishuConfig = options.feishuConfig;
 
   for (let i = 0; i < rowCount; i++) {
     const row = allRows.nth(i);
     const text = (await row.textContent().catch(() => '')) || '';
+    if (feishuConfig && !shouldIncludeLiveRow(text, feishuConfig)) continue;
     const live = parseLiveFromRowText(text, targetDate);
     if (!live || seen.has(live.id)) continue;
     seen.add(live.id);
@@ -411,8 +414,12 @@ async function findLiveRows(page, targetDate, options = {}) {
   const seen = new Set();
   const lives = [];
 
+  if (options.feishuConfig && shouldApplySchoolFilter(options.feishuConfig)) {
+    console.log(`  学段筛选: ${describeSchoolMode(options.feishuConfig)}`);
+  }
+
   await goToFirstPage(page);
-  await collectLiveRowsFromCurrentPage(page, targetDate, seen, lives);
+  await collectLiveRowsFromCurrentPage(page, targetDate, seen, lives, options);
   console.log(`  列表第 1 页: 累计匹配 ${lives.length} 场 (${targetDate})`);
 
   if (dateFilterApplied) {
@@ -451,7 +458,7 @@ async function findLiveRows(page, targetDate, options = {}) {
       pagesWithoutDate = 0;
     }
 
-    await collectLiveRowsFromCurrentPage(page, targetDate, seen, lives);
+    await collectLiveRowsFromCurrentPage(page, targetDate, seen, lives, options);
     console.log(`  列表第 ${pageNum} 页: 累计匹配 ${lives.length} 场 (${targetDate})`);
 
     if (!hasDateOnPage && lives.length > 0) break;

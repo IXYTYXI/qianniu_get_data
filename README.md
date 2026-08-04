@@ -20,7 +20,7 @@
 
 | 任务 | 脚本 | 飞书写入位置 |
 |------|------|-------------|
-| 任务 1 | `npm run task-barrage` | 小学弹幕 / 初中弹幕 / 高中弹幕 |
+| 任务 1 | `npm run task-barrage` | 小学弹幕 / 初高弹幕（或 初中、高中，见 `mergeMiddleHigh`） |
 | 任务 2 | `npm run task-audio` | 直播视频 表（日期、名称、音频） |
 
 **为什么要分开？**
@@ -231,6 +231,15 @@ cp feishu.config.example.json feishu.config.json
   }
 }
 ```
+
+**初高合并开关 `mergeMiddleHigh`：**
+
+| 值 | 抓取场次 | 弹幕表 |
+|----|---------|--------|
+| `true` | 【小学】+【初高】（【初中】【高中】也归入初高） | 小学弹幕、初高弹幕 |
+| `false` | 【小学】+【初中】+【高中】 | 小学、初中、高中弹幕 |
+
+也可用环境变量 `MERGE_MIDDLE_HIGH=1` / `0`。任务启动时会**自动检测** Base 内是否有对应表：有则复用 `tableId`，无则自动创建（初高表会参考初中/高中表结构），并写回 `feishu.config.json`。视频/音频仍写入「直播视频」表。
 
 **Base Token 获取方式：** 打开多维表格，浏览器地址栏中 `/base/` 后面即为 `baseToken`。各表的 `tableId` 可在表设置或 URL 中查看。
 

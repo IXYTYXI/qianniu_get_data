@@ -8,10 +8,10 @@
   "templateBaseToken": "YOUR_TEMPLATE_OR_CURRENT_BASE_TOKEN",
   "folderToken": "",
   "notifyChatId": "oc_35d62d745bfe00528766899ed5a4f498",
+  "mergeMiddleHigh": true,
   "tables": {
     "小学": { "name": "小学弹幕", "tableId": "tblXXXXXXXX" },
-    "初中": { "name": "初中弹幕", "tableId": "tblXXXXXXXX" },
-    "高中": { "name": "高中弹幕", "tableId": "tblXXXXXXXX" }
+    "初高": { "name": "初高弹幕", "tableId": "tblXXXXXXXX" }
   },
   "videoTable": {
     "name": "直播视频",

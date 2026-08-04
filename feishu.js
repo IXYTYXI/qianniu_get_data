@@ -4,6 +4,12 @@ const XLSX = require('xlsx');
 const appConfig = require('./config');
 const api = require('./feishu-api');
 const { FIELD_TYPE } = api;
+const {
+  detectSchoolLevel,
+  getSchoolTableKeys,
+  describeSchoolMode,
+  isMergeMiddleHigh,
+} = require('./school-level');
 
 const FEISHU_CONFIG_PATH = path.join(__dirname, 'feishu.config.json');
 const BATCH_SIZE = 200;
@@ -17,6 +23,21 @@ const VIDEO_TABLE_FIELDS = [
   { name: '日期', type: 'text' },
   { name: '视频', type: 'attachment' },
 ];
+
+const BARRAGE_TABLE_DEFAULT_NAMES = {
+  小学: '小学弹幕',
+  初高: '初高弹幕',
+  初中: '初中弹幕',
+  高中: '高中弹幕',
+};
+
+const BARRAGE_TABLE_STARTER_FIELDS = [
+  { name: '时间', type: 'text' },
+  { name: '内容', type: 'text' },
+  { name: '用户', type: 'text' },
+];
+
+const BARRAGE_CLONE_TEMPLATE_NAMES = ['初中弹幕', '高中弹幕', '小学弹幕'];
 
 function loadFeishuConfig() {
   if (!fs.existsSync(FEISHU_CONFIG_PATH)) {
@@ -71,28 +92,127 @@ function restoreArchivedConfig(month) {
 }
 
 async function mapTablesFromBase(appToken, config) {
-  const tables = await api.listTables(appToken);
-  const mapped = {};
-  for (const [school, spec] of Object.entries(config.tables || {})) {
-    const found = tables.find((t) => t.name === spec.name);
-    if (!found) {
-      throw new Error(`新 Base 中未找到表「${spec.name}」，请检查模板 Base 结构`);
-    }
-    mapped[school] = { name: spec.name, tableId: found.table_id };
-  }
-
-  const videoName = config.videoTable?.name || VIDEO_TABLE_NAME;
-  let videoTable = tables.find((t) => t.name === videoName);
-  if (!videoTable) {
-    console.log(`  新 Base 无「${videoName}」，自动创建...`);
-    const tableId = await api.createTable(appToken, videoName, VIDEO_TABLE_FIELDS);
-    videoTable = { name: videoName, table_id: tableId };
-  }
-
+  const updated = await ensureFeishuTables({ ...config, baseToken: appToken });
   return {
-    tables: mapped,
-    videoTable: { name: videoTable.name, tableId: videoTable.table_id },
+    tables: updated.tables,
+    videoTable: updated.videoTable,
   };
+}
+
+function normalizeSchoolTableSpecs(config) {
+  const specs = {};
+  for (const schoolKey of getSchoolTableKeys(config)) {
+    const existing = config.tables?.[schoolKey];
+    specs[schoolKey] = {
+      name: existing?.name || BARRAGE_TABLE_DEFAULT_NAMES[schoolKey],
+      tableId: existing?.tableId,
+    };
+  }
+  return specs;
+}
+
+async function cloneBarrageTableFromTemplate(appToken, sourceTableId, tableName) {
+  const tableId = await api.createTable(appToken, tableName, BARRAGE_TABLE_STARTER_FIELDS);
+  const sourceFields = await api.listTableFields(appToken, sourceTableId);
+  const targetFields = await api.listTableFields(appToken, tableId);
+  const targetNames = new Set(targetFields.map((f) => f.field_name));
+
+  for (const field of sourceFields) {
+    if (field.is_primary || field.type === 1005) continue;
+    if (field.field_name === SEQ_FIELD || field.type === FIELD_TYPE.formula) continue;
+    if (targetNames.has(field.field_name)) continue;
+    if (field.type !== FIELD_TYPE.text && field.type !== 1) continue;
+    try {
+      await api.createField(appToken, tableId, field.field_name, 'text');
+      targetNames.add(field.field_name);
+    } catch (e) {
+      if (!/FieldNameDuplicated|1254014/.test(e.message)) throw e;
+    }
+  }
+
+  await ensureDailySeqField(appToken, tableId, tableName);
+  return tableId;
+}
+
+async function ensureSchoolTable(appToken, listedTables, schoolKey, spec) {
+  const tableName = spec.name;
+
+  if (spec.tableId) {
+    const byId = listedTables.find((t) => t.table_id === spec.tableId);
+    if (byId) return { name: byId.name, tableId: byId.table_id };
+  }
+
+  const byName = listedTables.find((t) => t.name === tableName);
+  if (byName) {
+    return { name: byName.name, tableId: byName.table_id };
+  }
+
+  console.log(`  Base 中无「${tableName}」，自动创建...`);
+  let tableId;
+  if (tableName === BARRAGE_TABLE_DEFAULT_NAMES.初高) {
+    const template = listedTables.find((t) => BARRAGE_CLONE_TEMPLATE_NAMES.includes(t.name));
+    if (template) {
+      console.log(`  参考「${template.name}」结构创建「${tableName}」`);
+      tableId = await cloneBarrageTableFromTemplate(appToken, template.table_id, tableName);
+    } else {
+      tableId = await api.createTable(appToken, tableName, BARRAGE_TABLE_STARTER_FIELDS);
+      await ensureDailySeqField(appToken, tableId, tableName);
+    }
+  } else {
+    tableId = await api.createTable(appToken, tableName, BARRAGE_TABLE_STARTER_FIELDS);
+    await ensureDailySeqField(appToken, tableId, tableName);
+  }
+
+  if (!tableId) throw new Error(`创建弹幕表失败: ${tableName}`);
+  listedTables.push({ name: tableName, table_id: tableId });
+  return { name: tableName, tableId };
+}
+
+/**
+ * 检测 Base 内各学段弹幕表 / 视频表：存在则复用 tableId，缺失则自动创建并回写配置。
+ */
+async function ensureFeishuTables(config) {
+  if (!config?.baseToken) return config;
+
+  const listedTables = await api.listTables(config.baseToken);
+  const specs = normalizeSchoolTableSpecs(config);
+  const mapped = { ...(config.tables || {}) };
+  let changed = false;
+
+  for (const [schoolKey, spec] of Object.entries(specs)) {
+    const resolved = await ensureSchoolTable(config.baseToken, listedTables, schoolKey, spec);
+    const prev = mapped[schoolKey];
+    if (!prev || prev.tableId !== resolved.tableId || prev.name !== resolved.name) {
+      mapped[schoolKey] = resolved;
+      changed = true;
+    }
+  }
+
+  const activeKeys = getSchoolTableKeys(config);
+  for (const key of Object.keys(mapped)) {
+    if (!activeKeys.includes(key)) {
+      delete mapped[key];
+      changed = true;
+    }
+  }
+
+  const videoTableId = await ensureVideoTable({ ...config, tables: mapped });
+  const videoTable = {
+    name: config.videoTable?.name || VIDEO_TABLE_NAME,
+    tableId: videoTableId,
+  };
+  if (config.videoTable?.tableId !== videoTableId) changed = true;
+
+  if (!changed) return { ...config, tables: mapped, videoTable };
+
+  const next = {
+    ...config,
+    tables: mapped,
+    videoTable,
+  };
+  saveFeishuConfig(next);
+  console.log('  已同步 feishu.config.json 中的 tableId');
+  return next;
 }
 
 function resolveNotifyChatId(config) {
@@ -159,6 +279,7 @@ async function createMonthlyBaseFromTemplate(config, neededMonth) {
     folderToken: config.folderToken,
     baseNamePattern: config.baseNamePattern,
     notifyChatId: config.notifyChatId,
+    mergeMiddleHigh: config.mergeMiddleHigh,
   };
 
   saveFeishuConfig(newConfig);
@@ -174,31 +295,27 @@ async function createMonthlyBaseFromTemplate(config, neededMonth) {
  * - 新月份：复制 templateBaseToken（或当前 Base）并更新配置
  */
 async function ensureFeishuConfigForDate(targetDate) {
-  const config = loadFeishuConfig();
+  let config = loadFeishuConfig();
   const neededMonth = monthFromDate(targetDate);
-  if (config.month === neededMonth) return config;
-  if (!isAutoMonthEnabled(config)) {
-    console.log(`  提示: 目标日期 ${targetDate} 属于 ${neededMonth}，当前配置 month=${config.month}；可开启 autoCreateMonthly 或设置 FEISHU_AUTO_MONTH=1`);
-    return config;
+
+  if (config.month !== neededMonth) {
+    if (!isAutoMonthEnabled(config)) {
+      console.log(`  提示: 目标日期 ${targetDate} 属于 ${neededMonth}，当前配置 month=${config.month}；可开启 autoCreateMonthly 或设置 FEISHU_AUTO_MONTH=1`);
+    } else {
+      const restored = restoreArchivedConfig(neededMonth);
+      if (restored) {
+        config = restored;
+      } else if (neededMonth < config.month) {
+        throw new Error(
+          `需要 ${neededMonth} 的 Base，当前为 ${config.month}，且不存在归档 ${path.basename(archivedConfigPath(neededMonth))}`
+        );
+      } else {
+        config = await createMonthlyBaseFromTemplate(config, neededMonth);
+      }
+    }
   }
 
-  const restored = restoreArchivedConfig(neededMonth);
-  if (restored) return restored;
-
-  if (neededMonth < config.month) {
-    throw new Error(
-      `需要 ${neededMonth} 的 Base，当前为 ${config.month}，且不存在归档 ${path.basename(archivedConfigPath(neededMonth))}`
-    );
-  }
-
-  return createMonthlyBaseFromTemplate(config, neededMonth);
-}
-
-function detectSchoolLevel(text) {
-  if (text.includes('【小学】') || text.includes('小学')) return '小学';
-  if (text.includes('【初中】') || text.includes('初中')) return '初中';
-  if (text.includes('【高中】') || text.includes('高中')) return '高中';
-  return null;
+  return ensureFeishuTables(config);
 }
 
 function extractLiveId(text) {
@@ -713,11 +830,13 @@ async function uploadAudioToFeishu({ date, name, liveId, filePath, filePaths }) 
 }
 
 async function importBarrageToFeishu(filePath, hintText = '', options = {}) {
-  const config = loadFeishuConfig();
+  const config = await ensureFeishuTables(loadFeishuConfig());
   const filename = path.basename(filePath);
-  const school = detectSchoolLevel(`${hintText} ${filename}`);
+  const school = detectSchoolLevel(`${hintText} ${filename}`, config);
   if (!school) {
-    throw new Error(`无法识别学段: ${filename}`);
+    throw new Error(
+      `无法识别学段: ${filename}（当前: ${describeSchoolMode(config)}）`
+    );
   }
 
   const liveId = options.liveId || extractLiveId(hintText);
@@ -757,7 +876,11 @@ async function importBarrageToFeishu(filePath, hintText = '', options = {}) {
 module.exports = {
   loadFeishuConfig,
   ensureFeishuConfigForDate,
+  ensureFeishuTables,
   detectSchoolLevel,
+  getSchoolTableKeys,
+  describeSchoolMode,
+  isMergeMiddleHigh,
   extractLiveId,
   importBarrageToFeishu,
   resequenceRecordsForDate,
