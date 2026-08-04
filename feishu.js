@@ -47,7 +47,44 @@ function loadFeishuConfig() {
     );
   }
   api.getAppCredentials();
-  return JSON.parse(fs.readFileSync(FEISHU_CONFIG_PATH, 'utf8'));
+  const raw = fs.readFileSync(FEISHU_CONFIG_PATH, 'utf8');
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    throw new Error(
+      `feishu.config.json 格式错误: ${e.message}\n请检查是否有多余字符、注释或粘贴了两份 JSON`
+    );
+  }
+}
+
+function collectExistingFieldNames(fields) {
+  return new Set(
+    fields
+      .filter((f) => f.type !== 1005)
+      .map((f) => f.field_name)
+      .filter(Boolean)
+  );
+}
+
+/** xlsx 表头 → 飞书实际字段名（大小写不一致时复用已有列） */
+function resolveImportFieldMap(existingFields, headers) {
+  const byLower = new Map();
+  for (const f of existingFields) {
+    if (!f.field_name) continue;
+    byLower.set(f.field_name.toLowerCase(), f.field_name);
+  }
+  const map = {};
+  for (const header of headers) {
+    if (!header) continue;
+    if (existingFields.some((f) => f.field_name === header)) {
+      map[header] = header;
+    } else if (byLower.has(header.toLowerCase())) {
+      map[header] = byLower.get(header.toLowerCase());
+    } else {
+      map[header] = header;
+    }
+  }
+  return map;
 }
 
 function monthFromDate(dateStr) {
@@ -196,14 +233,15 @@ function extractLiveId(text) {
 
 async function ensureFields(appToken, tableId, headers) {
   const existing = await api.listTableFields(appToken, tableId);
-  const existingNames = new Set(
-    existing
-      .filter((f) => f.type !== 1005 && !f.is_primary)
-      .map((f) => f.field_name)
-  );
+  const existingNames = collectExistingFieldNames(existing);
 
   for (const header of headers) {
     if (!header || existingNames.has(header)) continue;
+    const alias = [...existingNames].find(
+      (name) => name.toLowerCase() === header.toLowerCase()
+    );
+    if (alias) continue;
+
     console.log(`  创建字段: ${header}`);
     try {
       await api.createField(appToken, tableId, header, 'text');
@@ -217,6 +255,7 @@ async function ensureFields(appToken, tableId, headers) {
       throw e;
     }
   }
+  return existing;
 }
 
 function extractDate(timeStr) {
@@ -321,13 +360,10 @@ async function ensureDailySeqField(appToken, tableId, tableName) {
   const existing = await api.listTableFields(appToken, tableId);
   const seqField = existing.find((f) => f.field_name === SEQ_FIELD);
 
-  if (seqField?.type === FIELD_TYPE.formula) {
-    return;
-  }
-
   if (seqField) {
-    console.log(`  序号字段为手动数字类型，改为公式自动编号...`);
-    await api.deleteField(appToken, tableId, seqField.field_id);
+    if (seqField.type === FIELD_TYPE.formula) return;
+    console.log(`  序号字段已存在（文本/数字），跳过改为公式（避免 1254014）`);
+    return;
   }
 
   const formula = buildDailySeqFormula(tableName);
@@ -481,8 +517,16 @@ function buildFeishuRecordName(liveId, name) {
 async function ensureAudioField(appToken, tableId) {
   const existing = await api.listTableFields(appToken, tableId);
   if (existing.some((f) => f.field_name === '音频')) return;
-  await api.createField(appToken, tableId, '音频', 'attachment');
-  console.log('  已创建字段: 音频');
+  try {
+    await api.createField(appToken, tableId, '音频', 'attachment');
+    console.log('  已创建字段: 音频');
+  } catch (e) {
+    if (/FieldNameDuplicated|1254014/.test(e.message)) {
+      console.log('  字段已存在，跳过: 音频');
+      return;
+    }
+    throw e;
+  }
 }
 
 async function uploadAttachmentToRecord({
@@ -723,10 +767,12 @@ async function importBarrageToFeishu(filePath, hintText = '', options = {}) {
 
   const writableHeaders = headers.filter((h) => h && !SKIP_IMPORT_COLUMNS.has(h));
   if (liveId) writableHeaders.push(LIVE_ID_FIELD);
-  await ensureFields(config.baseToken, table.tableId, writableHeaders);
+  const existingFields = await ensureFields(config.baseToken, table.tableId, writableHeaders);
   await ensureDailySeqField(config.baseToken, table.tableId, table.name);
 
   const { importHeaders, allRows, dates } = buildImportRows(headers, dataRows, liveId);
+  const fieldMap = resolveImportFieldMap(existingFields, importHeaders);
+  const feishuHeaders = importHeaders.map((h) => fieldMap[h] || h);
   for (const date of dates) {
     if (date === 'unknown') continue;
     if (liveId) {
@@ -735,7 +781,7 @@ async function importBarrageToFeishu(filePath, hintText = '', options = {}) {
       await deleteRecordsForDate(config.baseToken, table.tableId, date);
     }
   }
-  await batchCreateRecords(config.baseToken, table.tableId, importHeaders, allRows);
+  await batchCreateRecords(config.baseToken, table.tableId, feishuHeaders, allRows);
 
   fs.unlinkSync(filePath);
   console.log(`  导入完成，已删除本地文件: ${filename}`);

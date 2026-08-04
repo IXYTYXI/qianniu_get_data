@@ -139,16 +139,13 @@ async function returnToLiveList(page, targetDate) {
   await goToFirstPage(page);
 }
 
-async function checkVideoDownloadStatus(targetPage, live) {
-  console.log(`检查转码状态: ${live.id} ${live.name}`);
-
+async function openDownloadVideoDialog(targetPage) {
   const replayDownload = targetPage.locator(
     '.nav-list li:has-text("回放下载"), .sidebar li:has-text("回放下载"), ' +
     '.left-nav :text-is("回放下载"), li.tabs:has-text("回放下载"), span:has-text("回放下载")'
   ).first();
   if (!(await replayDownload.isVisible({ timeout: 5000 }).catch(() => false))) {
-    console.log('未找到「回放下载」菜单');
-    return { status: 'no_menu' };
+    return null;
   }
 
   await replayDownload.click();
@@ -156,32 +153,179 @@ async function checkVideoDownloadStatus(targetPage, live) {
 
   const dialog = targetPage.locator('.el-dialog__wrapper:visible').filter({ hasText: '下载视频' }).last();
   if (!(await dialog.isVisible({ timeout: 5000 }).catch(() => false))) {
-    console.log('未弹出「下载视频」对话框');
-    return { status: 'no_dialog' };
+    return null;
   }
 
-  const actionBtn = dialog.locator('.el-dialog__body button').first();
+  const actionBtn = dialog.locator('.el-dialog__body button, .el-dialog__body a').first();
   const btnText = ((await actionBtn.textContent().catch(() => '')) || '').replace(/\s+/g, ' ').trim();
+  return { dialog, actionBtn, btnText };
+}
 
-  if (!btnText) {
-    console.log('未找到下载按钮');
+function classifyDownloadButton(btnText) {
+  if (!btnText) return 'no_button';
+  if (/转码中|处理中|请稍后/.test(btnText)) return 'transcoding';
+  if (/^开始|发起|点击转码/.test(btnText) || (/转码/.test(btnText) && !/下载/.test(btnText))) {
+    return 'not_ready';
+  }
+  if (!/网页直接下载|下载MP4|下载.*视频/.test(btnText)) return 'unknown_button';
+  return 'ready';
+}
+
+async function extractDirectMp4Url(actionBtn, dialog) {
+  const fromBtn = await actionBtn.evaluate((el) => {
+    const pick = (node) => {
+      if (!node) return null;
+      if (node.href && /\.mp4/i.test(node.href)) return node.href;
+      const onclick = node.getAttribute('onclick') || '';
+      const match = onclick.match(/https?:[^'"\s]+\.mp4/i);
+      return match ? match[0] : null;
+    };
+    return pick(el) || pick(el.closest('a')) || pick(el.querySelector('a'));
+  }).catch(() => null);
+  if (fromBtn) return fromBtn;
+
+  const link = dialog.locator('a[href*=".mp4"], a[href*=".MP4"]').first();
+  if (await link.count().catch(() => 0)) {
+    return link.getAttribute('href').catch(() => null);
+  }
+  return null;
+}
+
+async function downloadMp4FromUrl(context, page, url, savePath) {
+  const absolute = url.startsWith('http') ? url : new URL(url, page.url()).href;
+  console.log(`  通过 MP4 直链下载...`);
+  const response = await context.request.get(absolute, {
+    timeout: config.videoDownloadTimeout,
+    headers: { Referer: page.url() },
+  });
+  if (!response.ok()) {
+    throw new Error(`直链下载失败 HTTP ${response.status()}`);
+  }
+  fs.mkdirSync(path.dirname(savePath), { recursive: true });
+  fs.writeFileSync(savePath, await response.body());
+  return savePath;
+}
+
+async function clickAndSaveMp4Download(targetPage, live, dialog, actionBtn, btnText) {
+  const savePath = buildVideoPath(live, `${live.id}.mp4`);
+  const context = targetPage.context();
+  const clickTimeout = 45_000;
+
+  const directUrl = await extractDirectMp4Url(actionBtn, dialog);
+  if (directUrl) {
+    await closeDialog(dialog);
+    try {
+      await downloadMp4FromUrl(context, targetPage, directUrl, savePath);
+      const size = await waitForFileReady(savePath, config.videoFileReadyTimeout, live.id);
+      const sizeMb = (size / 1024 / 1024).toFixed(1);
+      console.log(`  [${live.id}] 视频已保存(直链): ${savePath} (${sizeMb} MB)`);
+      return { status: 'downloaded', filePath: savePath };
+    } catch (err) {
+      console.log(`  [${live.id}] 直链下载失败，改点击按钮: ${err.message}`);
+    }
+  }
+
+  const opened = directUrl ? await openDownloadVideoDialog(targetPage) : { dialog, actionBtn, btnText };
+  if (!opened) {
+    return { status: 'no_dialog', error: '无法重新打开下载对话框' };
+  }
+  const activeDialog = opened.dialog;
+  const activeBtn = opened.actionBtn;
+  const activeText = opened.btnText || btnText;
+
+  const downloadPromise = targetPage.waitForEvent('download', { timeout: clickTimeout }).catch(() => null);
+  const responsePromise = targetPage.waitForResponse(
+    (r) => /\.mp4(\?|$)/i.test(r.url()) && r.status() >= 200 && r.status() < 400,
+    { timeout: clickTimeout }
+  ).catch(() => null);
+  const popupPromise = context.waitForEvent('page', { timeout: 10_000 }).catch(() => null);
+
+  console.log(`  [${live.id}] 点击下载: ${activeText}`);
+  await activeBtn.click({ force: true });
+
+  const download = await downloadPromise;
+  await closeDialog(activeDialog);
+
+  if (download) {
+    const promise = (async () => {
+      try {
+        await download.saveAs(savePath);
+        const size = await waitForFileReady(savePath, config.videoFileReadyTimeout, live.id);
+        const sizeMb = (size / 1024 / 1024).toFixed(1);
+        console.log(`  [${live.id}] 视频已保存: ${savePath} (${sizeMb} MB)`);
+        return { status: 'downloaded', filePath: savePath };
+      } catch (err) {
+        console.log(`  [${live.id}] 下载失败: ${err.message}`);
+        return { status: 'error', error: err.message, filePath: savePath };
+      }
+    })();
+    return { status: 'downloading', filePath: savePath, promise };
+  }
+
+  const response = await responsePromise;
+  if (response) {
+    try {
+      fs.mkdirSync(path.dirname(savePath), { recursive: true });
+      fs.writeFileSync(savePath, await response.body());
+      const size = await waitForFileReady(savePath, config.videoFileReadyTimeout, live.id);
+      const sizeMb = (size / 1024 / 1024).toFixed(1);
+      console.log(`  [${live.id}] 视频已保存(响应): ${savePath} (${sizeMb} MB)`);
+      return { status: 'downloaded', filePath: savePath };
+    } catch (err) {
+      console.log(`  [${live.id}] 响应落盘失败: ${err.message}`);
+    }
+  }
+
+  const popup = await popupPromise;
+  if (popup) {
+    try {
+      const popupUrl = popup.url();
+      if (/\.mp4/i.test(popupUrl)) {
+        await downloadMp4FromUrl(context, popup, popupUrl, savePath);
+        await popup.close().catch(() => {});
+        const size = await waitForFileReady(savePath, config.videoFileReadyTimeout, live.id);
+        const sizeMb = (size / 1024 / 1024).toFixed(1);
+        console.log(`  [${live.id}] 视频已保存(新标签): ${savePath} (${sizeMb} MB)`);
+        return { status: 'downloaded', filePath: savePath };
+      }
+      await popup.close().catch(() => {});
+    } catch (err) {
+      console.log(`  [${live.id}] 新标签下载失败: ${err.message}`);
+    }
+  }
+
+  return {
+    status: 'error',
+    error: '点击后未捕获 MP4（无 download 事件/直链/响应），请查看 screenshots',
+  };
+}
+
+async function checkVideoDownloadStatus(targetPage, live) {
+  console.log(`检查转码状态: ${live.id} ${live.name}`);
+
+  const opened = await openDownloadVideoDialog(targetPage);
+  if (!opened) {
+    console.log('未找到「回放下载」或未弹出对话框');
+    return { status: 'no_menu' };
+  }
+
+  const { dialog, actionBtn, btnText } = opened;
+  console.log(`  下载按钮状态: 「${btnText}」`);
+
+  const kind = classifyDownloadButton(btnText);
+  if (kind === 'no_button') {
     await closeDialog(dialog);
     return { status: 'no_button' };
   }
-
-  console.log(`  下载按钮状态: 「${btnText}」`);
-
-  if (/转码中|处理中|请稍后/.test(btnText)) {
+  if (kind === 'transcoding') {
     await closeDialog(dialog);
     return { status: 'transcoding', btnText };
   }
-
-  if (/^开始|发起|点击转码/.test(btnText) || (/转码/.test(btnText) && !/下载/.test(btnText))) {
+  if (kind === 'not_ready') {
     await closeDialog(dialog);
     return { status: 'not_ready', btnText };
   }
-
-  if (!/网页直接下载|下载MP4|下载.*视频/.test(btnText)) {
+  if (kind === 'unknown_button') {
     await closeDialog(dialog);
     return { status: 'unknown_button', btnText };
   }
@@ -206,68 +350,57 @@ async function checkVideoDownloadStatus(targetPage, live) {
  * 返回 downloaded（本地已有）| downloading（含 promise）| 其他跳过状态。
  */
 async function triggerVideoDownload(targetPage, live) {
-  const check = await checkVideoDownloadStatus(targetPage, live);
+  console.log(`检查并下载: ${live.id} ${live.name || ''}`);
 
-  if (check.status === 'transcoding') {
+  const opened = await openDownloadVideoDialog(targetPage);
+  if (!opened) {
+    console.log('未找到「回放下载」或未弹出对话框');
+    return { status: 'no_menu' };
+  }
+
+  const { dialog, actionBtn, btnText } = opened;
+  console.log(`  下载按钮状态: 「${btnText}」`);
+
+  const kind = classifyDownloadButton(btnText);
+  if (kind === 'transcoding') {
+    await closeDialog(dialog);
     console.log(`直播 ${live.id} 仍在转码中，跳过`);
-    return { status: 'transcoding' };
+    return { status: 'transcoding', btnText };
   }
-  if (check.status === 'not_ready') {
-    console.log(`直播 ${live.id} 尚未转码完成（${check.btnText}），跳过`);
-    return { status: 'not_ready', btnText: check.btnText };
+  if (kind === 'not_ready') {
+    await closeDialog(dialog);
+    console.log(`直播 ${live.id} 尚未转码完成（${btnText}），跳过`);
+    return { status: 'not_ready', btnText };
   }
-  if (check.status === 'unknown_button') {
-    console.log(`直播 ${live.id} 按钮状态不可下载: ${check.btnText}`);
-    return { status: 'unknown_button', btnText: check.btnText };
+  if (kind === 'unknown_button') {
+    await closeDialog(dialog);
+    console.log(`直播 ${live.id} 按钮状态不可下载: ${btnText}`);
+    return { status: 'unknown_button', btnText };
   }
-  if (check.status === 'disabled') {
-    console.log(`直播 ${live.id} 下载按钮不可用: ${check.btnText}`);
-    return { status: 'disabled', btnText: check.btnText };
-  }
-  if (check.status === 'downloaded') {
-    const sizeMb = (fs.statSync(check.filePath).size / 1024 / 1024).toFixed(1);
-    console.log(`  本地已有视频，跳过下载: ${check.filePath} (${sizeMb} MB)`);
-    return { status: 'downloaded', filePath: check.filePath, skippedDownload: true };
-  }
-  if (check.status !== 'ready') {
-    return check;
+  if (kind === 'no_button') {
+    await closeDialog(dialog);
+    return { status: 'no_button' };
   }
 
-  // 重新打开对话框并点击下载
-  const replayDownload = targetPage.locator(
-    '.nav-list li:has-text("回放下载"), .sidebar li:has-text("回放下载"), ' +
-    '.left-nav :text-is("回放下载"), li.tabs:has-text("回放下载"), span:has-text("回放下载")'
-  ).first();
-  await replayDownload.click();
-  await targetPage.waitForTimeout(2000);
-  const dialog = targetPage.locator('.el-dialog__wrapper:visible').filter({ hasText: '下载视频' }).last();
-  const actionBtn = dialog.locator('.el-dialog__body button').first();
-  const btnText = check.btnText;
+  if (await actionBtn.isDisabled().catch(() => false)) {
+    await closeDialog(dialog);
+    console.log(`直播 ${live.id} 下载按钮不可用: ${btnText}`);
+    return { status: 'disabled', btnText };
+  }
 
-  console.log(`  [${live.id}] 发起下载: ${btnText}`);
-  const [download] = await Promise.all([
-    targetPage.waitForEvent('download', { timeout: config.videoDownloadTimeout }),
-    actionBtn.click(),
-  ]);
+  const existingPath = findLocalVideo(live);
+  if (existingPath && fs.statSync(existingPath).size > 0) {
+    await closeDialog(dialog);
+    const sizeMb = (fs.statSync(existingPath).size / 1024 / 1024).toFixed(1);
+    console.log(`  本地已有视频，跳过下载: ${existingPath} (${sizeMb} MB)`);
+    return { status: 'downloaded', filePath: existingPath, skippedDownload: true };
+  }
 
-  const savePath = buildVideoPath(live, download.suggestedFilename());
-  await closeDialog(dialog);
-
-  const promise = (async () => {
-    try {
-      await download.saveAs(savePath);
-      const size = await waitForFileReady(savePath, config.videoFileReadyTimeout, live.id);
-      const sizeMb = (size / 1024 / 1024).toFixed(1);
-      console.log(`  [${live.id}] 视频已保存: ${savePath} (${sizeMb} MB)`);
-      return { status: 'downloaded', filePath: savePath };
-    } catch (err) {
-      console.log(`  [${live.id}] 下载失败: ${err.message}`);
-      return { status: 'error', error: err.message, filePath: savePath };
-    }
-  })();
-
-  console.log(`  [${live.id}] 下载已在后台进行，继续下一场...`);
-  return { status: 'downloading', filePath: savePath, promise };
+  const result = await clickAndSaveMp4Download(targetPage, live, dialog, actionBtn, btnText);
+  if (result.status === 'downloading' && result.promise) {
+    console.log(`  [${live.id}] 下载已在后台进行，继续下一场...`);
+  }
+  return result;
 }
 
 /** 阻塞式单场下载（兼容旧调用） */

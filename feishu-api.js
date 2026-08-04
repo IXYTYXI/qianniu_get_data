@@ -135,12 +135,15 @@ async function feishuRequest(method, apiPath, options = {}) {
       const data = await res.json();
       if (data.code !== 0) {
         const detail = data.error?.log_id ? ` (log_id: ${data.error.log_id})` : '';
-        throw new Error(`飞书 API 错误 [${data.code}]: ${data.msg}${detail}`);
+        const err = new Error(`飞书 API 错误 [${data.code}]: ${data.msg}${detail}`);
+        err.feishuCode = data.code;
+        throw err;
       }
       return data.data;
     } catch (err) {
       lastErr = err;
-      if (attempt < maxAttempts) {
+      const noRetry = err.feishuCode === 1254014 || err.feishuCode === 1254013;
+      if (attempt < maxAttempts && !noRetry) {
         const delayMs = attempt * 5000;
         console.log(`  飞书请求失败 (${attempt}/${maxAttempts}): ${err.message}，${delayMs / 1000}s 后重试...`);
         await new Promise((r) => setTimeout(r, delayMs));
