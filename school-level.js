@@ -20,9 +20,12 @@ function shouldApplySchoolFilter(config = {}) {
 }
 
 function getSchoolTableKeys(config = {}) {
-  return isMergeMiddleHigh(config)
+  const keys = isMergeMiddleHigh(config)
     ? ['小学', '初高']
     : ['小学', '初中', '高中'];
+  // 场次标题已使用【初高】标签时，始终需要初高弹幕表
+  if (!keys.includes('初高')) keys.push('初高');
+  return keys;
 }
 
 function detectSchoolLevel(text, config = {}) {
@@ -30,7 +33,7 @@ function detectSchoolLevel(text, config = {}) {
   const merge = isMergeMiddleHigh(config);
 
   if (/【初高】|初高/.test(hay)) {
-    return merge ? '初高' : null;
+    return '初高';
   }
   if (/【小学】/.test(hay) || (hay.includes('小学') && !hay.includes('初高'))) {
     return '小学';
