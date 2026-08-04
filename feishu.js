@@ -54,49 +54,8 @@ function monthFromDate(dateStr) {
   return String(dateStr).slice(0, 7);
 }
 
-function archivedConfigPath(month) {
-  return path.join(__dirname, `feishu.config.${month}.json`);
-}
-
-function isAutoMonthEnabled(config) {
-  if (process.env.FEISHU_AUTO_MONTH === '0') return false;
-  if (process.env.FEISHU_AUTO_MONTH === '1') return true;
-  return config.autoCreateMonthly === true;
-}
-
-function buildBaseName(config, month) {
-  if (config.baseNamePattern) {
-    return String(config.baseNamePattern).replace('{month}', month);
-  }
-  return `直播弹幕-${month}`;
-}
-
 function saveFeishuConfig(config) {
   fs.writeFileSync(FEISHU_CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`);
-}
-
-function archiveFeishuConfig(config) {
-  if (!config?.month) return;
-  const archivePath = archivedConfigPath(config.month);
-  fs.writeFileSync(archivePath, `${JSON.stringify(config, null, 2)}\n`);
-  console.log(`  已归档配置: ${path.basename(archivePath)}`);
-}
-
-function restoreArchivedConfig(month) {
-  const archivePath = archivedConfigPath(month);
-  if (!fs.existsSync(archivePath)) return null;
-  const config = JSON.parse(fs.readFileSync(archivePath, 'utf8'));
-  saveFeishuConfig(config);
-  console.log(`已切换飞书配置到 ${month}（读取归档 ${path.basename(archivePath)}）`);
-  return config;
-}
-
-async function mapTablesFromBase(appToken, config) {
-  const updated = await ensureFeishuTables({ ...config, baseToken: appToken });
-  return {
-    tables: updated.tables,
-    videoTable: updated.videoTable,
-  };
 }
 
 function normalizeSchoolTableSpecs(config) {
@@ -215,106 +174,16 @@ async function ensureFeishuTables(config) {
   return next;
 }
 
-function resolveNotifyChatId(config) {
-  return process.env.FEISHU_NOTIFY_CHAT_ID || config.notifyChatId || '';
-}
-
-function buildBaseUrl(appToken, config, copiedUrl) {
-  if (copiedUrl) return copiedUrl;
-  if (config.baseUrl && config.baseToken) {
-    return String(config.baseUrl).replace(config.baseToken, appToken);
-  }
-  return `https://feishu.cn/base/${appToken}`;
-}
-
-async function notifyMonthlyBaseCreated(config, neededMonth, appToken, copiedUrl) {
-  const chatId = resolveNotifyChatId(config);
-  if (!chatId) {
-    console.log('  未配置 notifyChatId，跳过群通知');
-    return;
-  }
-
-  const baseUrl = buildBaseUrl(appToken, config, copiedUrl);
-  const text = [
-    `【千牛数据】${neededMonth} 直播弹幕多维表格已自动创建`,
-    `名称：${config.baseName || buildBaseName(config, neededMonth)}`,
-    `链接：${baseUrl}`,
-  ].join('\n');
-
-  try {
-    await api.sendChatTextMessage(chatId, text);
-    console.log(`  已发送 Base 链接到群聊: ${chatId}`);
-  } catch (err) {
-    console.log(`  群通知发送失败（不影响任务）: ${err.message}`);
-    console.log('  请确认：应用已加入该群，且已开通 im:message:send 或 im:message:send_as_bot 权限');
-  }
-}
-
-async function createMonthlyBaseFromTemplate(config, neededMonth) {
-  const sourceToken = config.templateBaseToken || config.baseToken;
-  const baseName = buildBaseName(config, neededMonth);
-  console.log(`\n=== 自动创建 ${neededMonth} 多维表格（复制结构，不含数据）===`);
-  console.log(`  模板 Base: ${sourceToken}`);
-  console.log(`  新 Base 名称: ${baseName}`);
-
-  const copied = await api.copyBitableApp(sourceToken, {
-    name: baseName,
-    folderToken: config.folderToken,
-    withoutContent: true,
-  });
-
-  const mapped = await mapTablesFromBase(copied.app_token, config);
-  archiveFeishuConfig(config);
-
-  const newConfig = {
-    ...config,
-    month: neededMonth,
-    baseName,
-    baseToken: copied.app_token,
-    baseUrl: buildBaseUrl(copied.app_token, config, copied.url),
-    tables: mapped.tables,
-    videoTable: mapped.videoTable,
-    templateBaseToken: config.templateBaseToken || sourceToken,
-    autoCreateMonthly: config.autoCreateMonthly,
-    folderToken: config.folderToken,
-    baseNamePattern: config.baseNamePattern,
-    notifyChatId: config.notifyChatId,
-    mergeMiddleHigh: config.mergeMiddleHigh,
-  };
-
-  saveFeishuConfig(newConfig);
-  console.log(`  已写入 feishu.config.json，baseToken=${copied.app_token}\n`);
-  await notifyMonthlyBaseCreated(newConfig, neededMonth, copied.app_token, copied.url);
-  return newConfig;
-}
-
 /**
- * 按目标日期确保 feishu.config.json 指向对应月份 Base。
- * - 同月：不动作
- * - 补历史月：读取 feishu.config.YYYY-MM.json 归档
- * - 新月份：复制 templateBaseToken（或当前 Base）并更新配置
+ * 任务启动前确保飞书 Base 与表结构可用。
+ * 始终使用 feishu.config.json 中的固定 baseToken，不按月份切换或新建 Base。
  */
 async function ensureFeishuConfigForDate(targetDate) {
-  let config = loadFeishuConfig();
+  const config = loadFeishuConfig();
   const neededMonth = monthFromDate(targetDate);
-
-  if (config.month !== neededMonth) {
-    if (!isAutoMonthEnabled(config)) {
-      console.log(`  提示: 目标日期 ${targetDate} 属于 ${neededMonth}，当前配置 month=${config.month}；可开启 autoCreateMonthly 或设置 FEISHU_AUTO_MONTH=1`);
-    } else {
-      const restored = restoreArchivedConfig(neededMonth);
-      if (restored) {
-        config = restored;
-      } else if (neededMonth < config.month) {
-        throw new Error(
-          `需要 ${neededMonth} 的 Base，当前为 ${config.month}，且不存在归档 ${path.basename(archivedConfigPath(neededMonth))}`
-        );
-      } else {
-        config = await createMonthlyBaseFromTemplate(config, neededMonth);
-      }
-    }
+  if (config.month && config.month !== neededMonth) {
+    console.log(`  目标日期 ${targetDate}（${neededMonth}），写入固定 Base: ${config.baseName || config.baseToken}`);
   }
-
   return ensureFeishuTables(config);
 }
 
