@@ -61,28 +61,42 @@ function collectExistingFieldNames(fields) {
   return new Set(
     fields
       .filter((f) => f.type !== 1005)
-      .map((f) => f.field_name)
+      .map((f) => f.field_name || f.name)
       .filter(Boolean)
   );
 }
 
+/** xlsx 表头 → 飞书已有字段名（含主字段「内容」、大小写别名） */
+function resolveExistingFieldName(existingFields, header) {
+  if (!header) return null;
+  const names = existingFields
+    .map((f) => f.field_name || f.name)
+    .filter(Boolean);
+  if (names.includes(header)) return header;
+
+  const ci = names.find((n) => n.toLowerCase() === header.toLowerCase());
+  if (ci) return ci;
+
+  if (header === '内容') {
+    const primary = existingFields.find((f) => f.is_primary);
+    if (primary?.field_name || primary?.name) {
+      return primary.field_name || primary.name;
+    }
+    if (names.includes('文本')) return '文本';
+  }
+  return null;
+}
+
+function resolveFieldNameForHeader(header, existingFields) {
+  return resolveExistingFieldName(existingFields, header);
+}
+
 /** xlsx 表头 → 飞书实际字段名（大小写不一致时复用已有列） */
 function resolveImportFieldMap(existingFields, headers) {
-  const byLower = new Map();
-  for (const f of existingFields) {
-    if (!f.field_name) continue;
-    byLower.set(f.field_name.toLowerCase(), f.field_name);
-  }
   const map = {};
   for (const header of headers) {
     if (!header) continue;
-    if (existingFields.some((f) => f.field_name === header)) {
-      map[header] = header;
-    } else if (byLower.has(header.toLowerCase())) {
-      map[header] = byLower.get(header.toLowerCase());
-    } else {
-      map[header] = header;
-    }
+    map[header] = resolveExistingFieldName(existingFields, header) || header;
   }
   return map;
 }
@@ -231,29 +245,42 @@ function extractLiveId(text) {
     || null;
 }
 
-async function ensureFields(appToken, tableId, headers) {
-  const existing = await api.listTableFields(appToken, tableId);
-  const existingNames = collectExistingFieldNames(existing);
+async function prepareImportFields(appToken, tableId, headers) {
+  let existing = await api.listTableFields(appToken, tableId);
+  const missing = [];
 
   for (const header of headers) {
-    if (!header || existingNames.has(header)) continue;
-    const alias = [...existingNames].find(
-      (name) => name.toLowerCase() === header.toLowerCase()
-    );
-    if (alias) continue;
+    if (!header) continue;
+    if (header === '内容' && existing.some((f) => f.is_primary)) continue;
+    if (resolveFieldNameForHeader(header, existing)) continue;
+    missing.push(header);
+  }
 
+  if (!missing.length) return existing;
+
+  console.log(`  飞书表缺少字段，尝试创建: ${missing.join(', ')}`);
+  for (const header of missing) {
     console.log(`  创建字段: ${header}`);
     try {
       await api.createField(appToken, tableId, header, 'text');
-      existingNames.add(header);
     } catch (e) {
       if (/FieldNameDuplicated|1254014/.test(e.message)) {
         console.log(`  字段已存在，跳过: ${header}`);
-        existingNames.add(header);
         continue;
       }
-      throw e;
+      console.log(`  创建字段「${header}」失败，跳过（${e.message}）`);
     }
+  }
+
+  existing = await api.listTableFields(appToken, tableId);
+  const stillMissing = headers.filter(
+    (h) => h && !resolveFieldNameForHeader(h, existing)
+  );
+  if (stillMissing.length) {
+    throw new Error(
+      `飞书表缺少字段且无法自动创建: ${stillMissing.join(', ')}\n` +
+      '请在多维表格中手动添加上述字段，或将自建应用加为 Base 可编辑协作者。'
+    );
   }
   return existing;
 }
@@ -767,7 +794,7 @@ async function importBarrageToFeishu(filePath, hintText = '', options = {}) {
 
   const writableHeaders = headers.filter((h) => h && !SKIP_IMPORT_COLUMNS.has(h));
   if (liveId) writableHeaders.push(LIVE_ID_FIELD);
-  const existingFields = await ensureFields(config.baseToken, table.tableId, writableHeaders);
+  const existingFields = await prepareImportFields(config.baseToken, table.tableId, writableHeaders);
   await ensureDailySeqField(config.baseToken, table.tableId, table.name);
 
   const { importHeaders, allRows, dates } = buildImportRows(headers, dataRows, liveId);

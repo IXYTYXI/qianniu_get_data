@@ -2,7 +2,11 @@ const path = require('path');
 const fs = require('fs');
 const config = require('./config');
 const { importBarrageToFeishu, ensureFeishuConfigForDate, loadFeishuConfig } = require('./feishu');
-const { triggerVideoDownload, findLocalVideo } = require('./download-video');
+const {
+  clickAndSaveMp4Download,
+  findDialogActionButton,
+  findLocalVideo,
+} = require('./download-video');
 const { findRowByLiveId, waitForLogin: waitForBrowserLogin, dismissBlockingOverlays, findLiveRows, filterByDate: browserFilterByDate, launchBrowser } = require('./browser');
 
 // ========== UTC+8 Timezone Helpers ==========
@@ -508,8 +512,12 @@ class QianniuDownloader {
       return;
     }
 
-    const actionBtn = dialog.locator('.el-dialog__body button').first();
-    const btnText = ((await actionBtn.textContent().catch(() => '')) || '').replace(/\s+/g, ' ').trim();
+    const action = await findDialogActionButton(dialog);
+    if (!action) {
+      console.log('  下载对话框内未找到可操作按钮');
+      return;
+    }
+    const { actionBtn, btnText } = action;
     console.log(`  回放按钮状态: 「${btnText}」`);
 
     const closeBtn = dialog.locator('.el-dialog__headerbtn').first();
@@ -522,18 +530,20 @@ class QianniuDownloader {
       await closeDialog();
     } else if (/网页直接下载|下载MP4|下载.*视频/.test(btnText)) {
       if (this.options.mode === 'barrage-task') {
-        await closeDialog();
         const existingPath = findLocalVideo(live);
         if (existingPath) {
           const sizeMb = (fs.statSync(existingPath).size / 1024 / 1024).toFixed(1);
           console.log(`  视频已可下载，本地已有，跳过: ${existingPath} (${sizeMb} MB)`);
+          await closeDialog();
         } else {
-          console.log(`  视频已可下载（${btnText}），任务1 后台发起下载，继续导弹幕...`);
-          const result = await triggerVideoDownload(targetPage, live);
+          console.log(`  视频已可下载（${btnText}），弹窗内直接点击下载，继续导弹幕...`);
+          const result = await clickAndSaveMp4Download(targetPage, live, dialog, actionBtn, btnText);
           if (result.promise) {
             this.videoDownloadPromises.push(result.promise);
           } else if (result.status === 'downloaded' && result.filePath) {
             console.log(`  视频已在本地: ${result.filePath}`);
+          } else if (result.error) {
+            console.log(`  视频下载未成功: ${result.error}`);
           }
         }
       } else {

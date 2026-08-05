@@ -139,6 +139,28 @@ async function returnToLiveList(page, targetDate) {
   await goToFirstPage(page);
 }
 
+async function findDialogActionButton(dialog) {
+  const candidates = dialog.locator('.el-dialog__body button, .el-dialog__body a');
+  const count = await candidates.count().catch(() => 0);
+  const items = [];
+
+  for (let i = 0; i < count; i += 1) {
+    const btn = candidates.nth(i);
+    const btnText = ((await btn.textContent().catch(() => '')) || '').replace(/\s+/g, ' ').trim();
+    if (!btnText) continue;
+    items.push({ actionBtn: btn, btnText, kind: classifyDownloadButton(btnText) });
+  }
+
+  const ready = items.find((item) => item.kind === 'ready');
+  if (ready) return ready;
+
+  const waiting = items.find((item) => item.kind === 'transcoding' || item.kind === 'not_ready');
+  if (waiting) return waiting;
+
+  if (items.length) return items[0];
+  return null;
+}
+
 async function openDownloadVideoDialog(targetPage) {
   const replayDownload = targetPage.locator(
     '.nav-list li:has-text("回放下载"), .sidebar li:has-text("回放下载"), ' +
@@ -156,9 +178,9 @@ async function openDownloadVideoDialog(targetPage) {
     return null;
   }
 
-  const actionBtn = dialog.locator('.el-dialog__body button, .el-dialog__body a').first();
-  const btnText = ((await actionBtn.textContent().catch(() => '')) || '').replace(/\s+/g, ' ').trim();
-  return { dialog, actionBtn, btnText };
+  const action = await findDialogActionButton(dialog);
+  if (!action) return null;
+  return { dialog, actionBtn: action.actionBtn, btnText: action.btnText };
 }
 
 function classifyDownloadButton(btnText) {
@@ -685,6 +707,10 @@ if (require.main === module) {
 
 module.exports = {
   openControlCenter,
+  openDownloadVideoDialog,
+  findDialogActionButton,
+  classifyDownloadButton,
+  clickAndSaveMp4Download,
   checkVideoDownloadStatus,
   checkLiveDownloadStatus,
   waitForLivesTranscodeReady,
