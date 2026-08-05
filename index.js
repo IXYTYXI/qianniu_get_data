@@ -414,7 +414,9 @@ class QianniuDownloader {
       }
     }
 
-    await this.waitForAllDownloads();
+    if (this.options.mode !== 'barrage-task') {
+      await this.waitForAllDownloads();
+    }
     if (newPage && !newPage.isClosed()) {
       await newPage.waitForTimeout(1000);
       await newPage.close();
@@ -537,13 +539,18 @@ class QianniuDownloader {
           await closeDialog();
         } else {
           console.log(`  视频已可下载（${btnText}），弹窗内直接点击下载，继续导弹幕...`);
-          const result = await clickAndSaveMp4Download(targetPage, live, dialog, actionBtn, btnText);
-          if (result.promise) {
-            this.videoDownloadPromises.push(result.promise);
-          } else if (result.status === 'downloaded' && result.filePath) {
-            console.log(`  视频已在本地: ${result.filePath}`);
-          } else if (result.error) {
-            console.log(`  视频下载未成功: ${result.error}`);
+          this.suppressAutoDownloadHandler = true;
+          try {
+            const result = await clickAndSaveMp4Download(targetPage, live, dialog, actionBtn, btnText);
+            if (result.promise) {
+              this.videoDownloadPromises.push(result.promise);
+            } else if (result.status === 'downloaded' && result.filePath) {
+              console.log(`  视频已在本地: ${result.filePath}`);
+            } else if (result.error) {
+              console.log(`  视频下载未成功: ${result.error}`);
+            }
+          } finally {
+            this.suppressAutoDownloadHandler = false;
           }
         }
       } else {
