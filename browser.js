@@ -213,14 +213,27 @@ async function attemptLoginPageActions(page) {
 
   await dismissBlockingOverlays(page, '登录页');
 
-  const phone = process.env.QIANNIU_PHONE || process.env.QIANNIU_USERNAME;
+  const account = process.env.QIANNIU_USERNAME
+    || process.env.QIANNIU_ACCOUNT
+    || process.env.QIANNIU_PHONE;
   const password = process.env.QIANNIU_PASSWORD;
-  if (phone) {
-    const phoneInput = page.locator(
-      'input[type="tel"], input[placeholder*="手机"], input[placeholder*="账号"], input[name*="phone"], input[name*="mobile"]'
+
+  const accountTab = page.locator(
+    ':text-is("账号登录"), :text-is("账号"), span:has-text("账号登录"), a:has-text("账号登录")'
+  ).first();
+  if (await accountTab.isVisible({ timeout: 1000 }).catch(() => false)) {
+    console.log('  切换到「账号登录」…');
+    await accountTab.click({ timeout: 3000 }).catch(() => {});
+    await page.waitForTimeout(800);
+  }
+
+  if (account) {
+    const accountInput = page.locator(
+      'input[placeholder*="账号"], input[placeholder*="用户名"], input[name*="account"], input[name*="username"], ' +
+      'input[name*="user"], input[type="text"]:visible, input[type="tel"], input[placeholder*="手机"]'
     ).first();
-    if (await phoneInput.isVisible({ timeout: 1500 }).catch(() => false)) {
-      await phoneInput.fill(phone);
+    if (await accountInput.isVisible({ timeout: 1500 }).catch(() => false)) {
+      await accountInput.fill(account);
     }
   }
   if (password) {
@@ -252,9 +265,37 @@ function isLoggedInUrl(url) {
   return !s.includes('qiniulogin') && !s.includes('login');
 }
 
+function getQianniuCredentials() {
+  const account = process.env.QIANNIU_USERNAME
+    || process.env.QIANNIU_ACCOUNT
+    || process.env.QIANNIU_PHONE;
+  const password = process.env.QIANNIU_PASSWORD || '';
+  return {
+    account,
+    password,
+    hasCredentials: Boolean(account && password),
+  };
+}
+
+async function confirmLoggedInAtCenter(page) {
+  if (isLoggedInUrl(page.url()) && page.url().includes('/livestream/center')) {
+    return true;
+  }
+  await page.goto(config.centerUrl, { timeout: config.navigationTimeout });
+  await page.waitForTimeout(2000);
+  await dismissBlockingOverlays(page, '登录后');
+  return isLoggedInUrl(page.url());
+}
+
+/**
+ * 1. 优先复用 Profile 已有会话
+ * 2. 未登录时打开登录页；.env 有 QIANNIU_USERNAME + QIANNIU_PASSWORD 则自动填表登录
+ * 3. --skip-login = 无人值守：不长时间等人工，但仍会尝试自动登录并写入 Profile
+ */
 async function waitForLogin(page, options = {}) {
   const skipLogin = options.skipLogin;
   const waitMinutes = options.waitMinutes || config.loginWaitMinutes;
+  const { account, hasCredentials } = getQianniuCredentials();
 
   console.log('尝试直接访问直播中心...');
   await page.goto(config.centerUrl, { timeout: config.navigationTimeout });
@@ -262,12 +303,16 @@ async function waitForLogin(page, options = {}) {
   await dismissBlockingOverlays(page, '直播中心');
 
   if (isLoggedInUrl(page.url())) {
-    console.log('已登录（会话有效）');
+    console.log('已登录（Profile 会话有效）');
     return true;
   }
 
-  if (skipLogin) {
-    console.log('未登录且设置了 --skip-login');
+  console.log('Profile 无有效登录态，进入登录流程...');
+
+  if (skipLogin && !hasCredentials) {
+    console.log('无人值守（--skip-login）且 .env 未配置 QIANNIU_USERNAME + QIANNIU_PASSWORD');
+    console.log('请任选：① .env 填写账号密码后重跑（会自动登录并保存 Profile）');
+    console.log('     ② 手动运行一次不加 --skip-login，在浏览器中完成登录');
     return false;
   }
 
@@ -278,13 +323,19 @@ async function waitForLogin(page, options = {}) {
     await options.onLoginPage(page);
   }
 
-  console.log(`等待登录完成（最多 ${waitMinutes} 分钟，将自动点击登录并关闭通知）...`);
+  const unattended = skipLogin && hasCredentials;
+  const effectiveMinutes = unattended ? Math.min(waitMinutes, 3) : waitMinutes;
+  if (unattended) {
+    const masked = account.length > 2 ? `${account.slice(0, 2)}***` : '***';
+    console.log(`无人值守自动登录（账号 ${masked}，最多 ${effectiveMinutes} 分钟）...`);
+  } else {
+    console.log(`等待登录（最多 ${effectiveMinutes} 分钟；已配置账号时将自动填表，验证码/扫码需人工）...`);
+  }
 
-  const deadline = Date.now() + waitMinutes * 60 * 1000;
+  const deadline = Date.now() + effectiveMinutes * 60 * 1000;
   while (Date.now() < deadline) {
-    if (isLoggedInUrl(page.url())) {
-      console.log('检测到登录成功');
-      await dismissBlockingOverlays(page, '登录后');
+    if (await confirmLoggedInAtCenter(page)) {
+      console.log('登录成功，会话已写入 Profile');
       return true;
     }
     await attemptLoginPageActions(page);
@@ -292,9 +343,12 @@ async function waitForLogin(page, options = {}) {
     await page.waitForTimeout(3000);
   }
 
-  const ok = isLoggedInUrl(page.url());
-  if (ok) console.log('检测到登录成功');
-  return ok;
+  if (await confirmLoggedInAtCenter(page)) {
+    console.log('登录成功，会话已写入 Profile');
+    return true;
+  }
+  console.log('登录超时或失败（若需验证码，请去掉 --skip-login 手动登录一次）');
+  return false;
 }
 
 async function filterByDate(page, targetDate) {

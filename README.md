@@ -246,17 +246,33 @@ cp feishu.config.example.json feishu.config.json
 
 > **注意：** 自建应用使用 `tenant_access_token`，代表企业身份访问。请确保目标 Base 属于同一飞书企业，且应用权限已由管理员审批通过。
 
-### 3. 首次登录千牛
+### 3. 千牛登录态（Profile + 自动登录）
 
-首次运行需要手动登录，会打开 Chrome 并等待登录：
+脚本使用**独立 Chrome Profile** 保存登录态（Mac: `.chrome-profile/`，Windows: `%LOCALAPPDATA%\qianniu-chrome-profile`），与日常浏览器隔离。
 
-```bash
-npm run task-barrage -- --date yesterday
+**登录流程（每次任务启动时）：**
+
+1. 先访问直播中心 → 若 Profile 里**已有有效会话**，直接继续（日志：`已登录（Profile 会话有效）`）
+2. 若无会话 → 打开登录页；若 `.env` 配置了账号密码则**自动填表并点击登录**，成功后写入 Profile
+3. `--skip-login` 表示**无人值守**：不长时间等待人工，但**仍会执行上述自动登录**（需配置账号）
+
+在 `.env` 中配置（千牛为**账号登录**，非手机号）：
+
+```env
+QIANNIU_USERNAME=你的账号
+QIANNIU_PASSWORD=你的密码
 ```
 
-登录成功后，会话保存在 `.chrome-profile/`，后续可加 `--skip-login`。
+**部署机首次建议：**
 
-> **注意**：运行脚本时不要手动打开使用同一 profile 的 Chrome，否则 Playwright 无法启动。
+```bash
+# 可选：先设 PLAYWRIGHT_HEADLESS=0 观察登录页
+npm run task-barrage -- --date yesterday --skip-login
+```
+
+若登录页有验证码/扫码，去掉 `--skip-login` 手动完成一次即可，之后 Profile 可长期复用。
+
+> **注意**：运行脚本时不要手动打开使用同一 Profile 的 Chrome，否则 Playwright 无法启动。
 
 ## 定时任务配置
 
@@ -306,7 +322,7 @@ mkdir -p logs
 | `install-scheduled-tasks.ps1` | 一键注册两个定时任务 |
 | `uninstall-scheduled-tasks.ps1` | 卸载定时任务 |
 
-Windows 定时任务会自动使用 **headless Chrome**，Profile 默认在 `%LOCALAPPDATA%\qianniu-chrome-profile`（避免 `Program Files` 无写权限）。首次升级后请把旧目录 `.chrome-profile` 复制到新路径，以免重新登录。
+Windows 定时任务会自动使用 **headless Chrome**，Profile 默认在 `%LOCALAPPDATA%\qianniu-chrome-profile`。请在部署机 `.env` 配置 `QIANNIU_USERNAME` / `QIANNIU_PASSWORD`，定时任务虽带 `--skip-login`，会话失效时会**自动登录并写回 Profile**。首次可手动跑一次 `run-task-barrage.bat` 验证。
 
 #### 一键安装（推荐）
 

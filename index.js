@@ -699,7 +699,7 @@ class QianniuDownloader {
     try {
       const result = await this.runCore({ manageSession: true });
       if (!result.ok) {
-        console.error('未登录且设置了 --skip-login，任务终止');
+        console.error('登录失败：Profile 无有效会话且自动登录未成功，请检查 .env 中 QIANNIU_USERNAME / QIANNIU_PASSWORD');
         await this.close();
         process.exit(1);
       }
